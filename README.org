@@ -1,0 +1,97 @@
+#+TITLE: org-dayflow
+#+AUTHOR: yoshzucker
+
+* org-dayflow
+
+Simple day-flowing timeline view for Org.
+
+org-dayflow displays Org tasks on a compact horizontal timeline (day / week / month / year scales) with a density histogram and aligned task titles. It is designed as a focused, visual complement to =org-agenda= rather than a replacement.
+
+** Features
+
+- Multiple zoom levels (day, week, month, year) with sensible defaults and offsets
+- Vertical histogram showing task density per time unit (deadline / scheduled / active)
+- Rich interactive filtering (tag, todo, property, category, regexp) with include/exclude and "filter at point"
+- Saved queries + per-session history
+- Follow mode, direct editing (schedule/deadline/todo), and navigation that feels like =org-agenda=
+- Window management modeled after =org-agenda-window-setup= (including restore after quit)
+- Zero external dependencies beyond Org and Emacs
+
+** Installation
+
+*** Using straight.el (recommended)
+
+#+begin_src emacs-lisp
+(use-package org-dayflow
+  :straight (:host github :repo "yoshzucker/org-dayflow")
+  :after org
+  :config
+  (global-set-key (kbd "C-c f") #'org-dayflow))
+#+end_src
+
+*** Using package.el + Git (manual)
+
+Clone the repository into your =load-path= and require it:
+
+#+begin_src emacs-lisp
+(add-to-list 'load-path "/path/to/org-dayflow")
+(require 'org-dayflow)
+#+end_src
+
+** Quick Start
+
+=M-x org-dayflow= (or bind it) and press =f=, =d=, =w=, =m=, or =y= to open a view.
+
+In the Dayflow buffer the most important keys are:
+
+| Key | Command                        | Description |
+|-----|--------------------------------|-------------|
+| =q=   | =org-dayflow-quit=             | Quit (restores windows if configured) |
+| =r=   | =org-dayflow-refresh=          | Re-render the view |
+| =n= / =p= | next / previous item        | Move between tasks |
+| =RET= | =org-dayflow-switch-to=        | Jump to the Org heading |
+| =TAB= | =org-dayflow-goto=             | Open heading in other window |
+| =]=   | =org-dayflow-filter-dispatch=  | Powerful filter menu (t/d/p/c/r/...) |
+| =f=   | =org-dayflow-toggle-follow=    | Toggle follow mode |
+| =s= / =d= / =t= | schedule / deadline / todo | Edit the task at point |
+| =+= / =-= | zoom out / zoom in           | Change scale |
+| =<= / =>= | move timeline backward / forward | |
+| =. =  | =org-dayflow-offset-reset=     | Reset to default offset for current scale |
+
+** Customization
+
+#+begin_src emacs-lisp
+;; Window behavior identical to org-agenda
+(setq org-dayflow-window-setup 'reorganize-frame
+      org-dayflow-restore-windows-after-quit t)
+
+;; Compact rendering
+(setq org-dayflow-high-density t)
+
+;; How many units to show and default starting point
+(setq org-dayflow-units-length 40
+      org-dayflow-default-offsets '((day . -14) (week . -4) ...))
+#+end_src
+
+See =M-x customize-group RET org-dayflow RET= for the full list.
+
+** Comparison with Similar Tools
+
+- =org-agenda=: more powerful and general, table-oriented, huge feature surface.
+- =org-ql-view=: excellent query power and listing; org-dayflow focuses on the visual "flow" across days.
+- org-dayflow tries to stay small, depend only on Org, and reuse the same design patterns (window setup, remote edit, markers, follow mode, etc.) that =org-agenda= uses.
+
+** License
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+See the [[file:LICENSE][LICENSE]] file for the full text of the GNU General Public License
+version 3 (same license as Org mode).
+
+** Contributing
+
+Bug reports and pull requests are welcome on GitHub.
+Please keep changes small and focused; the goal is a lean, self-contained visual Org timeline.
