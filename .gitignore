@@ -1,17 +1,10 @@
-# Compiled
+# Byte-comiled files
 *.elc
 
-# Packaging
-.cask/
-.eask/
-.eldev/
-.keg/
-
-# Built distribution
-dist/
+# Aut-generated files
+\#*\#
+.\#*
 
 # Backup files
 *~
-
-# Undo-tree save-files
-*.~undo-tree
+*.bak
