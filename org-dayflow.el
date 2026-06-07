@@ -51,12 +51,15 @@
   :type 'integer
   :group 'org-dayflow)
 
-(defcustom org-dayflow-scales '(day week month year)
+(defcustom org-dayflow-scales '(ten-min hour day week month year decade)
   "List of available scales in order from most detailed to most general."
-  :type '(repeat (choice (const day)
+  :type '(repeat (choice (const ten-min)
+                         (const hour)
+                         (const day)
                          (const week)
                          (const month)
-                         (const year)))
+                         (const year)
+                         (const decade)))
   :group 'org-dayflow)
 
 (defcustom org-dayflow-default-scale 'day
@@ -67,15 +70,21 @@
   :group 'org-dayflow)
 
 (defcustom org-dayflow-default-offsets
-  '((day . -7)
-    (week . -3)
-    (month . -1)
-    (year . -10))
+  '((ten-min . -6)
+    (hour    . -2)
+    (day     . -7)
+    (week    . -3)
+    (month   . -1)
+    (year    . -10)
+    (decade  . -2))
   "Default offsets from today for each scale in org-dayflow view."
-  :type '(alist :key-type (choice (const day)
+  :type '(alist :key-type (choice (const ten-min)
+                                  (const hour)
+                                  (const day)
                                   (const week)
                                   (const month)
-                                  (const year))
+                                  (const year)
+                                  (const decade))
                 :value-type integer)
   :group 'org-dayflow)
 
@@ -149,37 +158,37 @@ Used to restore the previous layout when quitting with
 `org-dayflow-restore-windows-after-quit' non-nil.")
 
 (defface org-dayflow-query-face
-  '((t (:inherit font-lock-comment-face)))
+  '((t (:inherit org-agenda-structure)))
   "Face for displaying the current query in Org Dayflow."
   :group 'org-dayflow)
 
 (defface org-dayflow-label-face
-  '((t (:inherit font-lock-type-face)))
+  '((t (:inherit org-agenda-structure)))
   "Face for labels (e.g., month or year names) in org-dayflow."
   :group 'org-dayflow)
 
 (defface org-dayflow-units-face
-  '((t (:inherit font-lock-builtin-face)))
+  '((t (:inherit org-agenda-structure)))
   "Face for labels (e.g., month or year names) in org-dayflow."
   :group 'org-dayflow)
 
 (defface org-dayflow-weekday-face
-  '((t (:inherit font-lock-builtin-face)))
+  '((t (:inherit org-agenda-structure)))
   "Face for weekdays in org-dayflow (only relevant for day scale)."
   :group 'org-dayflow)
 
 (defface org-dayflow-weekend-face
-  '((t (:inherit font-lock-keyword-face)))
+  '((t (:inherit org-agenda-structure :weight bold)))
   "Face for weekends in org-dayflow (only relevant for day scale)."
   :group 'org-dayflow)
 
 (defface org-dayflow-today-face
-  '((t (:inherit font-lock-warning-face)))
+  '((t (:inherit org-agenda-structure :weight bold :slant italic)))
   "Face for today's date in org-dayflow."
   :group 'org-dayflow)
 
 (defface org-dayflow-histogram-deadline-face
-  '((t (:inherit font-lock-constant-face)))
+  '((t (:inherit org-warning)))
   "Face used for deadline markers in dayflow bar graph."
   :group 'org-dayflow)
 
@@ -189,22 +198,22 @@ Used to restore the previous layout when quitting with
   :group 'org-dayflow)
 
 (defface org-dayflow-histogram-scheduled-face
-  '((t (:inherit font-lock-variable-name-face)))
+  '((t (:inherit org-scheduled)))
   "Face used for scheduled task markers in dayflow bar graph."
   :group 'org-dayflow)
 
 (defface org-dayflow-histogram-deadline-done-face
-  '((t :distant-foreground "gray40"))
+  '((t (:inherit org-done)))
   "Face for completed deadline tasks."
   :group 'org-dayflow)
 
 (defface org-dayflow-histogram-active-done-face
-  '((t :distant-foreground "gray40"))
+  '((t (:inherit org-done)))
   "Face for completed active tasks."
   :group 'org-dayflow)
 
 (defface org-dayflow-histogram-scheduled-done-face
-  '((t :distant-foreground "gray40"))
+  '((t (:inherit org-done)))
   "Face for completed scheduled tasks."
   :group 'org-dayflow)
 
@@ -213,7 +222,7 @@ Used to restore the previous layout when quitting with
   "Face for org-dayflow bar overlays.")
 
 (defface org-dayflow-title-done-face
-  '((t :inherit font-lock-comment-face))
+  '((t (:inherit org-done)))
   "Face for DONE or CANCELLED task titles."
   :group 'org-dayflow)
 
@@ -245,8 +254,9 @@ Used to restore the previous layout when quitting with
     (define-key map (kbd "RET") #'org-dayflow-switch-to)
     (define-key map (kbd "TAB") #'org-dayflow-goto)
     (define-key map (kbd "r") #'org-dayflow-refresh)
-    (define-key map (kbd "+") #'org-dayflow-scale-increase)
-    (define-key map (kbd "-") #'org-dayflow-scale-decrease)
+    (define-key map (kbd "-") #'org-dayflow-scale-zoom-out)
+    (define-key map (kbd "+") #'org-dayflow-scale-zoom-in)
+    (define-key map (kbd "Z") #'org-dayflow-scale)
     (define-key map (kbd "n") #'org-dayflow-next-item)
     (define-key map (kbd "p") #'org-dayflow-previous-item)
     (define-key map (kbd "j") #'org-dayflow-next-item)
@@ -270,17 +280,21 @@ Used to restore the previous layout when quitting with
   "Return the width (in characters) of one unit based on `org-dayflow-unit-format`."
   (length (format org-dayflow-unit-format 1)))
 
-(defun org-dayflow--date-today ()
-  "Return today's date as a (month day year) list, ignoring time."
-  (let ((now (decode-time (current-time))))
-    (list (nth 4 now) (nth 3 now) (nth 5 now))))
+(defun org-dayflow--label-safe-pos (pos positions)
+  "Return the first position >= POS that does not overlap the last entry in POSITIONS.
+POSITIONS is a list of (pos label-string) in reverse-push order."
+  (if (null positions)
+      pos
+    (max pos (+ (caar positions) (length (cadr (car positions)))))))
 
-(defun org-dayflow--date-timestamp (timestamp)
-  "Convert an Org TIMESTAMP string to (month day year) list.
-If TIMESTAMP is nil, return nil."
-  (when timestamp
-    (let ((parsed (org-parse-time-string timestamp)))
-      (list (nth 4 parsed) (nth 3 parsed) (nth 5 parsed)))))
+(defun org-dayflow--render-label-positions (positions total-width)
+  "Render POSITIONS (sorted list of (pos label-string)) into a padded line of TOTAL-WIDTH chars."
+  (let ((line ""))
+    (dolist (entry positions)
+      (setq line (concat line
+                         (make-string (- (car entry) (length line)) ?\s)
+                         (propertize (cadr entry) 'face 'org-dayflow-label-face))))
+    (concat line (make-string (max 0 (- total-width (length line))) ?\s))))
 
 (defun org-dayflow--date+ (base &rest adds)
   "Add all ADDS (month day year style) to BASE."
@@ -291,38 +305,70 @@ If TIMESTAMP is nil, return nil."
                :initial-value base))))
 
 (defun org-dayflow--date-start ()
-  "Return the start date considering the current offset and scale."
-  (let ((today (org-dayflow--date-today))
+  "Return the start date/datetime considering the current offset and scale."
+  (let ((today (org-dayflow--datetime-now))
         (x org-dayflow--current-offset))
     (pcase org-dayflow--current-scale
-      ('day   (org-dayflow--date+ today (list 0 x 0)))
-      ('week  (org-dayflow--date+ today (list 0 (* x 7) 0)))
-      ('month (org-dayflow--date+ today (list x 0 0)))
-      ('year  (org-dayflow--date+ today (list 0 0 x)))
-      (_      (org-dayflow--date+ today (list 0 x 0))))))
-
-(defun org-dayflow--date< (&rest dates)
-  "Return non-nil if all DATES are in strictly increasing chronological order."
-  (apply #'< (mapcar (lambda (x) (calendar-absolute-from-gregorian x)) dates)))
-
-(defun org-dayflow--date-min (dates)
-  "Return the earliest date in DATES."
-  (car (sort (copy-sequence dates) #'org-dayflow--date<)))
-
-(defun org-dayflow--date-max (dates)
-  "Return the latest date in DATES."
-  (car (sort (copy-sequence dates)
-             (lambda (d1 d2) (not (org-dayflow--date< d1 d2))))))
+      ('ten-min (let* ((now-min (org-dayflow--datetime-to-minutes (org-dayflow--datetime-now)))
+                       (aligned (* (/ now-min 10) 10)))
+                  (org-dayflow--minutes-to-datetime (+ aligned (* x 10)))))
+      ('hour    (let* ((now-min (org-dayflow--datetime-to-minutes (org-dayflow--datetime-now)))
+                       (aligned (* (/ now-min 60) 60)))
+                  (org-dayflow--minutes-to-datetime (+ aligned (* x 60)))))
+      ('day     (org-dayflow--date+ today (list 0 x 0)))
+      ('week    (org-dayflow--date+ today (list 0 (* x 7) 0)))
+      ('month   (org-dayflow--date+ today (list x 0 0)))
+      ('year    (org-dayflow--date+ today (list 0 0 x)))
+      ('decade  (org-dayflow--date+ today (list 0 0 (* x 10))))
+      (_        (org-dayflow--date+ today (list 0 x 0))))))
 
 (defun org-dayflow--day- (&rest dates)
   "Return the number of days between the first date and each of the rest."
   (cl-reduce #'- (mapcar #'calendar-absolute-from-gregorian dates)))
 
 (defun org-dayflow--month- (date1 date2)
-  "Return the number of whole months between START and END dates.
-START and END are (month day year) lists."
-  (+ (* (- (nth 2 date1) (nth 2 date2)) 12)
-     (- (nth 0 date1) (nth 0 date2))))
+  "Return the number of whole months between DATE1 and DATE2 (month day year ...) lists."
+  (cl-destructuring-bind (m1 _d1 y1 . _r1) date1
+    (cl-destructuring-bind (m2 _d2 y2 . _r2) date2
+      (+ (* (- y1 y2) 12) (- m1 m2)))))
+
+(defun org-dayflow--datetime-now ()
+  "Return current time as (month day year hour minute)."
+  (cl-destructuring-bind (_sec min hour day month year . _rest) (decode-time (current-time))
+    (list month day year hour min)))
+
+(defun org-dayflow--datetime-timestamp (timestamp)
+  "Convert Org TIMESTAMP to (month day year hour minute), or nil if TIMESTAMP is nil."
+  (when timestamp
+    (cl-destructuring-bind (_sec min hour day month year . _rest) (org-parse-time-string timestamp)
+      (list month day year (or hour 0) (or min 0)))))
+
+(defun org-dayflow--datetime-to-minutes (dt)
+  "Convert (month day year hour minute) to absolute minutes."
+  (cl-destructuring-bind (month day year hour minute) dt
+    (+ (* (calendar-absolute-from-gregorian (list month day year)) 1440)
+       (* hour 60)
+       minute)))
+
+(defun org-dayflow--minutes-to-datetime (abs-min)
+  "Convert absolute minutes to (month day year hour minute)."
+  (let* ((abs-days (/ abs-min 1440))
+         (rem      (% abs-min 1440)))
+    (cl-destructuring-bind (month day year) (calendar-gregorian-from-absolute abs-days)
+      (list month day year (/ rem 60) (% rem 60)))))
+
+(defun org-dayflow--datetime< (&rest datetimes)
+  "Return non-nil if DATETIMES are in strictly increasing order by absolute minute."
+  (apply #'< (mapcar #'org-dayflow--datetime-to-minutes datetimes)))
+
+(defun org-dayflow--datetime-min (datetimes)
+  "Return the earliest datetime in DATETIMES."
+  (car (sort (copy-sequence datetimes) #'org-dayflow--datetime<)))
+
+(defun org-dayflow--datetime-max (datetimes)
+  "Return the latest datetime in DATETIMES."
+  (car (sort (copy-sequence datetimes)
+             (lambda (a b) (not (org-dayflow--datetime< a b))))))
 
 ;;; Helper commands
 (defun org-dayflow--buffer-name (&optional scale)
@@ -335,39 +381,23 @@ START and END are (month day year) lists."
   (setq org-dayflow--current-offset (or (alist-get scale org-dayflow-default-offsets) 0)))
 
 (defun org-dayflow--day-scale-labels (start days)
-  "Generate a line of month names, shifting later months to avoid overlap."
+  "Generate a line of month name labels for DAY scale."
   (let* ((start-abs (calendar-absolute-from-gregorian start))
          (unit-char-width (org-dayflow--unit-char-width))
-         (result (make-list (* days unit-char-width) " "))
          (positions '()))
     (dotimes (d days)
-      (let* ((date (calendar-gregorian-from-absolute (+ start-abs d)))
-             (month-name (format-time-string "%B" (encode-time 0 0 0 (nth 1 date) (nth 0 date) (nth 2 date)))))
-        (unless (and positions (string= (cadr (car (last positions))) month-name))
-          (let* ((pos (* d unit-char-width))
-                 (shift 0)
-                 (safe-pos pos))
-            (when positions
-              (let* ((last-pos (car (car (last positions))))
-                     (last-name (cadr (car (last positions))))
-                     (last-end (+ last-pos (length last-name))))
-                (when (< pos last-end)
-                  (setq shift (- last-end pos))
-                  (setq safe-pos (+ pos shift)))))
-            (setq positions (append positions (list (list safe-pos month-name))))))))
-    (let ((line ""))
-      (dolist (entry positions)
-        (let ((pos (nth 0 entry))
-              (name (nth 1 entry)))
-          (setq line (concat line
-                             (make-string (- pos (length line)) ?\s)
-                             (propertize name 'face 'org-dayflow-label-face)))))
-      (concat line (make-string (max 0 (- (* days unit-char-width) (length line))) ?\s)))))
+      (cl-destructuring-bind (month day year)
+          (calendar-gregorian-from-absolute (+ start-abs d))
+        (let* ((label (format-time-string "%B" (encode-time 0 0 0 day month year))))
+          (unless (equal label (cadr (car positions)))
+            (push (list (org-dayflow--label-safe-pos (* d unit-char-width) positions) label)
+                  positions)))))
+    (org-dayflow--render-label-positions (nreverse positions) (* days unit-char-width))))
 
 (defun org-dayflow--day-scale-units (start days)
   "Generate a line of dates starting from START date for DAYS days."
   (let ((start-abs (calendar-absolute-from-gregorian start))
-        (today-abs (calendar-absolute-from-gregorian (org-dayflow--date-today)))
+        (today-abs (calendar-absolute-from-gregorian (org-dayflow--datetime-now)))
         (day-width (org-dayflow--unit-char-width))
         (line ""))
     (dotimes (d days (string-trim-right line))
@@ -383,35 +413,19 @@ START and END are (month day year) lists."
 (defun org-dayflow--week-scale-labels (start weeks)
   "Generate a line of year labels for WEEK scale."
   (let* ((start-abs (calendar-absolute-from-gregorian start))
+         (unit-char-width (org-dayflow--unit-char-width))
          (positions '()))
     (dotimes (w weeks)
-      (let* ((date (calendar-gregorian-from-absolute (+ start-abs (* w 7))))
-             (year (nth 2 date)))
-        (unless (and positions (= (cadr (car (last positions))) year))
-          (let* ((pos (* w 3)) ;; "%02d "で3文字単位
-                 (shift 0)
-                 (safe-pos pos))
-            (when positions
-              (let* ((last-pos (car (car (last positions))))
-                     (last-year (cadr (car (last positions))))
-                     (last-end (+ last-pos (length (number-to-string last-year)))))
-                (when (< pos last-end)
-                  (setq shift (- last-end pos))
-                  (setq safe-pos (+ pos shift)))))
-            (setq positions (append positions (list (list safe-pos year))))))))
-    (let ((line ""))
-      (dolist (entry positions)
-        (let ((pos (nth 0 entry))
-              (year (nth 1 entry)))
-          (setq line (concat line
-                             (make-string (- pos (length line)) ?\s)
-                             (propertize (format "%d" year) 'face 'org-dayflow-label-face)))))
-      line)))
+      (let* ((label (format "%d" (nth 2 (calendar-gregorian-from-absolute (+ start-abs (* w 7)))))))
+        (unless (equal label (cadr (car positions)))
+          (push (list (org-dayflow--label-safe-pos (* w unit-char-width) positions) label)
+                positions))))
+    (org-dayflow--render-label-positions (nreverse positions) (* weeks unit-char-width))))
 
 (defun org-dayflow--week-scale-units (start weeks)
   "Generate a line of ISO week numbers starting from START for WEEKS weeks."
   (let ((start-abs (calendar-absolute-from-gregorian start))
-        (today-abs (calendar-absolute-from-gregorian (org-dayflow--date-today)))
+        (today-abs (calendar-absolute-from-gregorian (org-dayflow--datetime-now)))
         (line ""))
     (dotimes (w weeks (string-trim-right line))
       (let* ((week-start-abs (+ start-abs (* w 7)))
@@ -426,49 +440,29 @@ START and END are (month day year) lists."
     line))
 
 (defun org-dayflow--month-scale-labels (start months)
-  "Generate a line of year labels, shifting later labels to avoid overlap, starting at arbitrary month."
+  "Generate a line of year labels for MONTH scale."
   (let* ((unit-char-width (org-dayflow--unit-char-width))
          (year (nth 2 start))
          (month (nth 0 start))
          (positions '())
-         (pos 0)
-         (first t))
+         (pos 0))
     (dotimes (_ months)
-      (when (or first (= month 1))
-        (let* ((year-str (format "%4d" year))
-               (safe-pos pos))
-          (when positions
-            (let* ((last-pos (caar (last positions)))
-                   (last-name (cadr (car (last positions))))
-                   (last-end (+ last-pos (length last-name))))
-              (when (< safe-pos last-end)
-                (setq safe-pos last-end))))
-          (push (list safe-pos year-str) positions))
-        (setq first nil))
+      (when (or (null positions) (= month 1))
+        (push (list (org-dayflow--label-safe-pos pos positions) (format "%4d" year))
+              positions))
       (setq month (1+ month))
       (when (> month 12)
         (setq month 1)
         (setq year (1+ year)))
       (setq pos (+ pos unit-char-width)))
-    (setq positions (nreverse positions))
-    (let ((line ""))
-      (dolist (entry positions)
-        (let ((p (nth 0 entry))
-              (name (nth 1 entry)))
-          (setq line (concat line
-                             (make-string (- p (length line)) ?\s)
-                             (propertize name 'face 'org-dayflow-label-face)))))
-      (concat line (make-string (max 0 (- (* months unit-char-width) (length line))) ?\s)))))
+    (org-dayflow--render-label-positions (nreverse positions) (* months unit-char-width))))
 
 (defun org-dayflow--month-scale-units (start months)
   "Generate a line of month numbers for MONTH scale."
-  (let* ((year (nth 2 start))
-         (month (nth 0 start))
-         (today (org-dayflow--date-today))
-         (today-month (nth 0 today))
-         (today-year (nth 2 today))
-         (line ""))
-    (dotimes (_ months)
+  (cl-destructuring-bind (month _d1 year . _r1) start
+    (cl-destructuring-bind (today-month _d2 today-year . _r2) (org-dayflow--datetime-now)
+    (let ((line ""))
+    (dotimes (_i months)
       (let* ((face (if (and (= month today-month) (= year today-year))
                        'org-dayflow-today-face
                      'org-dayflow-units-face)))
@@ -479,12 +473,12 @@ START and END are (month day year) lists."
       (when (> month 12)
         (setq month 1)
         (setq year (1+ year))))
-    (string-trim-right line)))
+    (string-trim-right line)))))
 
 (defun org-dayflow--year-scale-units (start years)
   "Generate a line of year numbers for YEAR scale."
   (let ((start-year (nth 2 start))
-        (today-year (nth 2 (org-dayflow--date-today)))
+        (today-year (nth 2 (org-dayflow--datetime-now)))
         (line ""))
     (dotimes (y years)
       (let ((year (+ start-year y))
@@ -494,6 +488,104 @@ START and END are (month day year) lists."
         (setq line (concat line
                            (propertize (format org-dayflow-unit-format year) 'face face)))))
     (string-trim-right line)))
+
+(defun org-dayflow--decade-scale-labels (start decades)
+  "Generate a line of century labels for DECADE scale."
+  (let* ((unit-char-width (org-dayflow--unit-char-width))
+         (start-decade (* (/ (nth 2 start) 10) 10))
+         (positions '())
+         (pos 0))
+    (dotimes (d decades)
+      (let* ((decade (+ start-decade (* d 10))))
+        (when (or (null positions) (= (% decade 100) 0))
+          (push (list (org-dayflow--label-safe-pos pos positions)
+                      (format "%4d" (* (/ decade 100) 100)))
+                positions))
+        (setq pos (+ pos unit-char-width))))
+    (org-dayflow--render-label-positions (nreverse positions) (* decades unit-char-width))))
+
+(defun org-dayflow--decade-scale-units (start decades)
+  "Generate a line of decade labels for DECADE scale."
+  (let* ((start-decade (* (/ (nth 2 start) 10) 10))
+         (today-decade (* (/ (nth 2 (org-dayflow--datetime-now)) 10) 10))
+         (line ""))
+    (dotimes (d decades)
+      (let* ((decade (+ start-decade (* d 10)))
+             (face (if (= decade today-decade)
+                       'org-dayflow-today-face
+                     'org-dayflow-units-face)))
+        (setq line (concat line
+                           (propertize (format org-dayflow-unit-format (% decade 100))
+                                       'face face)))))
+    (string-trim-right line)))
+
+(defun org-dayflow--hour-scale-labels (start hours)
+  "Generate date labels (e.g. \"Jun 7\") for HOUR scale."
+  (let* ((start-abs-min (org-dayflow--datetime-to-minutes start))
+         (unit-char-width (org-dayflow--unit-char-width))
+         (positions '()))
+    (dotimes (h hours)
+      (cl-destructuring-bind (month day year . _)
+          (org-dayflow--minutes-to-datetime (+ start-abs-min (* h 60)))
+        (let* ((label (format-time-string "%b %d" (encode-time 0 0 0 day month year))))
+          (unless (equal label (cadr (car positions)))
+            (push (list (org-dayflow--label-safe-pos (* h unit-char-width) positions) label)
+                  positions)))))
+    (org-dayflow--render-label-positions (nreverse positions) (* hours unit-char-width))))
+
+(defun org-dayflow--hour-scale-units (start hours)
+  "Generate hour number labels (00–23) for HOUR scale. START is (month day year hour minute)."
+  (let* ((start-abs-min  (org-dayflow--datetime-to-minutes start))
+         (now-min        (org-dayflow--datetime-to-minutes (org-dayflow--datetime-now)))
+         (now-hour-start (* (/ now-min 60) 60))
+         (line ""))
+    (dotimes (h hours (string-trim-right line))
+      (let* ((abs-min (+ start-abs-min (* h 60)))
+             (dt      (org-dayflow--minutes-to-datetime abs-min))
+             (face    (if (= abs-min now-hour-start)
+                          'org-dayflow-today-face
+                        'org-dayflow-units-face)))
+        (setq line (concat line
+                           (propertize (format org-dayflow-unit-format (nth 3 dt))
+                                       'face face)))))
+    line))
+
+(defun org-dayflow--ten-min-scale-labels (start units)
+  "Generate hour labels for TEN-MIN scale.
+First label uses \"Jun 07 HH\" form; subsequent labels show only \"HH\"."
+  (let* ((start-abs-min (org-dayflow--datetime-to-minutes start))
+         (unit-char-width (org-dayflow--unit-char-width))
+         (positions '())
+         (prev-hour-str nil))
+    (dotimes (u units)
+      (cl-destructuring-bind (month day year hour minute)
+          (org-dayflow--minutes-to-datetime (+ start-abs-min (* u 10)))
+        (let* ((hour-str (format-time-string "%b %d %H" (encode-time 0 minute hour day month year))))
+          (unless (equal hour-str prev-hour-str)
+            (let* ((label (if positions
+                              (format-time-string "%H" (encode-time 0 minute hour day month year))
+                            hour-str)))
+              (push (list (org-dayflow--label-safe-pos (* u unit-char-width) positions) label)
+                    positions)
+              (setq prev-hour-str hour-str))))))
+    (org-dayflow--render-label-positions (nreverse positions) (* units unit-char-width))))
+
+(defun org-dayflow--ten-min-scale-units (start units)
+  "Generate 10-minute labels (00,10,...,50) for TEN-MIN scale. START is (month day year hour minute)."
+  (let* ((start-abs-min   (org-dayflow--datetime-to-minutes start))
+         (now-min         (org-dayflow--datetime-to-minutes (org-dayflow--datetime-now)))
+         (now-ten-start   (* (/ now-min 10) 10))
+         (line ""))
+    (dotimes (u units (string-trim-right line))
+      (let* ((abs-min (+ start-abs-min (* u 10)))
+             (dt      (org-dayflow--minutes-to-datetime abs-min))
+             (face    (if (= abs-min now-ten-start)
+                          'org-dayflow-today-face
+                        'org-dayflow-units-face)))
+        (setq line (concat line
+                           (propertize (format org-dayflow-unit-format (nth 4 dt))
+                                       'face face)))))
+    line))
 
 (defun org-dayflow--scale-lines (scale start units)
   "Generate label and unit lines based on SCALE."
@@ -522,11 +614,18 @@ START and END are (month day year) lists."
 (defun org-dayflow--title-unit (start task-date)
   "Return the position (unit offset) for TASK-DATE from START depending on current scale."
   (pcase org-dayflow--current-scale
-    ('day (org-dayflow--day- task-date start))
-    ('week (/ (org-dayflow--day- task-date start) 7))
-    ('month (org-dayflow--month- task-date start))
-    ('year (- (nth 2 task-date) (nth 2 start)))
-    (_ (org-dayflow--day- task-date start))))
+    ('ten-min (/ (- (org-dayflow--datetime-to-minutes task-date)
+                    (org-dayflow--datetime-to-minutes start))
+                 10))
+    ('hour    (/ (- (org-dayflow--datetime-to-minutes task-date)
+                    (org-dayflow--datetime-to-minutes start))
+                 60))
+    ('day     (org-dayflow--day- task-date start))
+    ('week    (/ (org-dayflow--day- task-date start) 7))
+    ('month   (org-dayflow--month- task-date start))
+    ('year    (- (nth 2 task-date) (nth 2 start)))
+    ('decade  (- (/ (nth 2 task-date) 10) (/ (nth 2 start) 10)))
+    (_        (org-dayflow--day- task-date start))))
 
 (defun org-dayflow--get-heading-face ()
   "Get the appropriate Org heading face based on the heading level."
@@ -850,7 +949,7 @@ Display MESSAGE along with the timestamp."
   "Return the unit offset where the task's title should appear, or nil if out of range."
   (cl-destructuring-bind (&key scheduled deadline active &allow-other-keys) task
     (let* ((chosen (or deadline active scheduled))
-           (date (org-dayflow--date-timestamp chosen)))
+           (date (org-dayflow--datetime-timestamp chosen)))
       (when date
         (let ((offset (org-dayflow--title-unit start date)))
           (when (and (<= 0 offset) (< offset units))
@@ -875,23 +974,23 @@ Display MESSAGE along with the timestamp."
 (defun org-dayflow--bar-region (task start units unit-char-width)
   "Return (START-POS . END-POS) of the bar for TASK, or nil if outside view."
   (cl-destructuring-bind (&key scheduled deadline active &allow-other-keys) task
-    (let* ((scheduled-date (org-dayflow--date-timestamp scheduled))
-           (deadline-date (org-dayflow--date-timestamp deadline))
-           (start-dates (delq nil (list scheduled-date deadline-date)))
-           (end-dates (delq nil (list deadline-date)))
-           (active-date (org-dayflow--date-timestamp active)))
+    (let* ((scheduled-date (org-dayflow--datetime-timestamp scheduled))
+           (deadline-date  (org-dayflow--datetime-timestamp deadline))
+           (start-dates    (delq nil (list scheduled-date deadline-date)))
+           (end-dates      (delq nil (list deadline-date)))
+           (active-date    (org-dayflow--datetime-timestamp active)))
       (when active-date
         (setq start-dates (append start-dates (list active-date)))
         (setq end-dates (append end-dates (list active-date))))
       (when (and start-dates end-dates)
-        (let* ((start-date (org-dayflow--date-min start-dates))
-               (end-date   (org-dayflow--date-max end-dates))
+        (let* ((start-date   (org-dayflow--datetime-min start-dates))
+               (end-date     (org-dayflow--datetime-max end-dates))
                (start-offset (org-dayflow--title-unit start start-date))
                (end-offset   (org-dayflow--title-unit start end-date))
-               (bar-start (max 0 start-offset))
-               (bar-end   (min units end-offset)))
+               (bar-start    (max 0 start-offset))
+               (bar-end      (min units end-offset)))
           (when (> bar-end bar-start)
-            (let* ((line-start (line-beginning-position 0))
+            (let* ((line-start    (line-beginning-position 0))
                    (bar-pos-start (+ line-start (* bar-start unit-char-width)))
                    (bar-pos-end   (+ line-start (* bar-end unit-char-width))))
               (cons bar-pos-start bar-pos-end))))))))
@@ -920,7 +1019,7 @@ Display MESSAGE along with the timestamp."
                'face 'org-dayflow-query-face))
       (insert (if org-dayflow-high-density "\n" "\n\n"))
       (dolist (line label-lines)
-        (insert line "\n"))
+        (when line (insert line "\n")))
       (org-dayflow--insert-histogram tasks start units unit-char-width)
       (unless org-dayflow-high-density (insert "\n"))
       (dolist (task tasks)
@@ -938,7 +1037,7 @@ Display MESSAGE along with the timestamp."
   (when (derived-mode-p 'org-dayflow-mode)
     (org-dayflow--render)))
 
-(defun org-dayflow-scale-increase ()
+(defun org-dayflow-scale-zoom-out ()
   "Increase org-dayflow scale (zoom out) by moving to the next broader unit."
   (interactive)
   (let* ((scales org-dayflow-scales)
@@ -948,7 +1047,7 @@ Display MESSAGE along with the timestamp."
       (org-dayflow--scale-set (nth (1+ pos) scales))
       (org-dayflow-refresh))))
 
-(defun org-dayflow-scale-decrease ()
+(defun org-dayflow-scale-zoom-in ()
   "Decrease org-dayflow scale (zoom in) by moving to the next finer unit."
   (interactive)
   (let* ((scales org-dayflow-scales)
@@ -957,6 +1056,16 @@ Display MESSAGE along with the timestamp."
     (when (and pos (> pos 0))
       (org-dayflow--scale-set (nth (1- pos) scales))
       (org-dayflow-refresh))))
+
+(defun org-dayflow-scale (scale)
+  "Switch to SCALE, selected via minibuffer completion."
+  (interactive
+   (list (intern (completing-read
+                  (format "Scale (current: %s): " org-dayflow--current-scale)
+                  (mapcar #'symbol-name org-dayflow-scales)
+                  nil t))))
+  (org-dayflow--scale-set scale)
+  (org-dayflow-refresh))
 
 (defun org-dayflow-next-item (n)
   "Move to the next N-th item in the org-dayflow buffer."
@@ -1364,13 +1473,16 @@ Respects `org-dayflow-restore-windows-after-quit' and the value of
 (defun org-dayflow ()
   "Prompt for a view scale and display org-dayflow timeline accordingly."
   (interactive)
-  (let ((key (read-key "org-dayflow: [f]default [d]ay [w]eek [m]onth [y]ear")))
+  (let ((key (read-key "org-dayflow: [f]default [t]en-min [h]our [d]ay [w]eek [m]onth [y]ear [D]ecade")))
     (pcase key
       (?f (org-dayflow-display))
+      (?t (org-dayflow-display 'ten-min))
+      (?h (org-dayflow-display 'hour))
       (?d (org-dayflow-display 'day))
       (?w (org-dayflow-display 'week))
       (?m (org-dayflow-display 'month))
       (?y (org-dayflow-display 'year))
+      (?D (org-dayflow-display 'decade))
       (_ (message "Unknown key: %c" key)))))
 
 (define-derived-mode org-dayflow-mode special-mode "Org-Dayflow"
