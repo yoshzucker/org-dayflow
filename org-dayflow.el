@@ -203,17 +203,17 @@ Used to restore the previous layout when quitting with
   :group 'org-dayflow)
 
 (defface org-dayflow-histogram-deadline-done-face
-  '((t (:inherit org-done)))
+  '((t (:inherit org-headline-done)))
   "Face for completed deadline tasks."
   :group 'org-dayflow)
 
 (defface org-dayflow-histogram-active-done-face
-  '((t (:inherit org-done)))
+  '((t (:inherit org-headline-done)))
   "Face for completed active tasks."
   :group 'org-dayflow)
 
 (defface org-dayflow-histogram-scheduled-done-face
-  '((t (:inherit org-done)))
+  '((t (:inherit org-headline-done)))
   "Face for completed scheduled tasks."
   :group 'org-dayflow)
 
@@ -222,7 +222,7 @@ Used to restore the previous layout when quitting with
   "Face for org-dayflow bar overlays.")
 
 (defface org-dayflow-title-done-face
-  '((t (:inherit org-done)))
+  '((t (:inherit org-headline-done)))
   "Face for DONE or CANCELLED task titles."
   :group 'org-dayflow)
 
@@ -461,19 +461,19 @@ POSITIONS is a list of (pos label-string) in reverse-push order."
   "Generate a line of month numbers for MONTH scale."
   (cl-destructuring-bind (month _d1 year . _r1) start
     (cl-destructuring-bind (today-month _d2 today-year . _r2) (org-dayflow--datetime-now)
-    (let ((line ""))
-    (dotimes (_i months)
-      (let* ((face (if (and (= month today-month) (= year today-year))
-                       'org-dayflow-today-face
-                     'org-dayflow-units-face)))
-        (setq line (concat line
-                           (propertize (format org-dayflow-unit-format month)
-                                       'face face))))
-      (setq month (1+ month))
-      (when (> month 12)
-        (setq month 1)
-        (setq year (1+ year))))
-    (string-trim-right line)))))
+      (let ((line ""))
+        (dotimes (_i months)
+          (let* ((face (if (and (= month today-month) (= year today-year))
+                           'org-dayflow-today-face
+                         'org-dayflow-units-face)))
+            (setq line (concat line
+                               (propertize (format org-dayflow-unit-format month)
+                                           'face face))))
+          (setq month (1+ month))
+          (when (> month 12)
+            (setq month 1)
+            (setq year (1+ year))))
+        (string-trim-right line)))))
 
 (defun org-dayflow--year-scale-units (start years)
   "Generate a line of year numbers for YEAR scale."
