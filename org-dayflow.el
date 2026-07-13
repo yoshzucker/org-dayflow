@@ -247,9 +247,15 @@ Applied to active-timestamp time ranges (events / appointments)."
   '((t (:inherit hl-line)))
   "Face for the vertical highlight of the current-time column.
 Applied across histogram / task rows at the cell containing the
-current time.  Also reused for the cursor-column stripe.  Merged
-into the `face' text property with APPEND so title / occupation /
-box faces keep priority."
+current time.  Merged into the `face' text property with APPEND
+so title / occupation / box faces keep priority."
+  :group 'org-dayflow)
+
+(defface org-dayflow-cursor-column-face
+  '((t (:inherit hl-line)))
+  "Face for the vertical highlight of the cursor column.
+Applied via overlay across histogram / task rows at the cell the
+cursor currently sits on, and redrawn on every cursor movement."
   :group 'org-dayflow)
 
 (defface org-dayflow-title-done-face
@@ -1157,6 +1163,44 @@ keeps priority in the merged `face' text property."
     (when (and (<= 0 cell) (< cell org-dayflow-units-length))
       cell)))
 
+(defun org-dayflow--pos-at-column (col)
+  "Return buffer position on the current line at display column COL.
+Walks character by character so wide (multi-column) characters are
+never split.  When COL falls inside a wide char, returns the position
+just past that char.  Never modifies the buffer.  If the line ends
+before COL, returns end-of-line."
+  (save-excursion
+    (beginning-of-line)
+    (let ((limit (line-end-position)))
+      (while (and (< (point) limit)
+                  (< (current-column) col))
+        (forward-char 1))
+      (point))))
+
+(defun org-dayflow--pad-line-to-column (col)
+  "Pad the current line with plain spaces up to display column COL.
+Inserted spaces have no text properties, so they do not inherit
+face from surrounding text.  No-op when the line already reaches COL."
+  (end-of-line)
+  (let ((cur (current-column)))
+    (when (< cur col)
+      (let ((s (point)))
+        (insert (make-string (- col cur) ?\s))
+        (set-text-properties s (point) nil)))))
+
+(defun org-dayflow--pad-grid-to-full-width (grid-start units unit-char-width)
+  "Pad every grid row from GRID-START to full width UNITS * UNIT-CHAR-WIDTH.
+Uses face-less spaces so the padding does not inherit any face
+from the last real character on the line.  Called at render time
+so that `org-dayflow--update-cursor-highlight' can position
+overlays without ever modifying the read-only buffer."
+  (let ((full (* units unit-char-width)))
+    (save-excursion
+      (goto-char grid-start)
+      (while (not (eobp))
+        (org-dayflow--pad-line-to-column full)
+        (forward-line 1)))))
+
 (defun org-dayflow--clear-cursor-highlight ()
   "Delete cursor-tracking overlays if any."
   (mapc (lambda (ov) (when (overlayp ov) (delete-overlay ov)))
@@ -1167,7 +1211,12 @@ keeps priority in the merged `face' text property."
   (setq org-dayflow--cursor-unit-overlay nil))
 
 (defun org-dayflow--update-cursor-highlight ()
-  "Redraw cursor column / unit overlays for the current cursor position."
+  "Redraw cursor column / unit overlays for the current cursor position.
+Assumes `org-dayflow--render' pre-padded every grid row and the
+unit-label row to the full grid width, so this function never has
+to modify the (read-only) buffer.  Uses `org-dayflow--pos-at-column'
+to keep alignment correct on rows containing multi-column
+characters."
   (when (derived-mode-p 'org-dayflow-mode)
     (org-dayflow--clear-cursor-highlight)
     (let ((cell (org-dayflow--cursor-cell))
@@ -1180,24 +1229,23 @@ keeps priority in the merged `face' text property."
           (save-excursion
             (goto-char grid)
             (while (not (eobp))
-              (beginning-of-line)
-              (move-to-column left t)
-              (let ((s (point)))
-                (move-to-column right t)
-                (let ((ov (make-overlay s (point))))
-                  (overlay-put ov 'face 'org-dayflow-now-column-face)
-                  (overlay-put ov 'priority -20)
-                  (push ov org-dayflow--cursor-column-overlays)))
+              (let* ((s (org-dayflow--pos-at-column left))
+                     (e (org-dayflow--pos-at-column right)))
+                (when (< s e)
+                  (let ((ov (make-overlay s e)))
+                    (overlay-put ov 'face 'org-dayflow-cursor-column-face)
+                    (overlay-put ov 'priority -20)
+                    (push ov org-dayflow--cursor-column-overlays))))
               (forward-line 1)))
           (save-excursion
             (goto-char unit)
-            (move-to-column left t)
-            (let ((s (point)))
-              (move-to-column right t)
-              (let ((ov (make-overlay s (point))))
-                (overlay-put ov 'face 'org-dayflow-cursor-unit-face)
-                (overlay-put ov 'priority 20)
-                (setq org-dayflow--cursor-unit-overlay ov)))))))))
+            (let* ((s (org-dayflow--pos-at-column left))
+                   (e (org-dayflow--pos-at-column right)))
+              (when (< s e)
+                (let ((ov (make-overlay s e)))
+                  (overlay-put ov 'face 'org-dayflow-cursor-unit-face)
+                  (overlay-put ov 'priority 20)
+                  (setq org-dayflow--cursor-unit-overlay ov))))))))))
 
 (defun org-dayflow--render ()
   "Render the timeline contents in the current buffer."
@@ -1222,6 +1270,10 @@ keeps priority in the merged `face' text property."
           (when line
             (setq unit-line-start (point))
             (insert line "\n")))
+        (when unit-line-start
+          (save-excursion
+            (goto-char unit-line-start)
+            (org-dayflow--pad-line-to-column (* units unit-char-width))))
         (setq grid-start (point))
         (org-dayflow--insert-histogram tasks start units unit-char-width)
         (unless org-dayflow-high-density (insert "\n"))
@@ -1233,6 +1285,7 @@ keeps priority in the merged `face' text property."
            (org-dayflow--occupation-region task start units unit-char-width))
           (org-dayflow--draw-working-box
            (org-dayflow--working-region task start units unit-char-width)))
+        (org-dayflow--pad-grid-to-full-width grid-start units unit-char-width)
         (org-dayflow--draw-now-column grid-start start units unit-char-width)
         (setq org-dayflow--unit-line-start unit-line-start)
         (setq org-dayflow--grid-start grid-start))
