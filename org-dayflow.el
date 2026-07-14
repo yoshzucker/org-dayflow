@@ -228,8 +228,8 @@ overlay."
   :group 'org-dayflow)
 
 (defface org-dayflow-title-box-face
-  '((t (:inherit font-lock-keyword-face
-        :box (:line-width (-1 . -1)))))
+  '((t (:inherit font-lock-string-face
+                 :box (:line-width (-1 . -1)))))
   "Face for the working-window box overlay in org-dayflow.
 Applied to the SCHEDULED..DEADLINE range (or a single-point
 SCHEDULED / DEADLINE).  Uses negative :line-width so the box is
@@ -831,8 +831,12 @@ and the atomic forms understood by `org-dayflow--query-atom-matches-p'."
     (`(category ,cat)
      (string= (org-get-category) cat))
     (`(regexp ,re)
-     (let ((case-fold-search t)
-           (re (if (stringp re) re (prin1-to-string re))))
+     (let* ((case-fold-search t)
+            (re (cond
+                 ((stringp re) re)
+                 ((and (symbolp re) (boundp re) (stringp (symbol-value re)))
+                  (symbol-value re))
+                 (t (prin1-to-string re)))))
        (save-excursion
          (org-back-to-heading t)
          (let ((end (save-excursion (or (outline-next-heading) (point-max)))))
