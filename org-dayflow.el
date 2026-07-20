@@ -1740,7 +1740,7 @@ Respects `org-dayflow-restore-windows-after-quit' and the value of
   (interactive)
   (let ((key (read-key "org-dayflow: [f]default [t]en-min [h]our [d]ay [w]eek [m]onth [y]ear [D]ecade")))
     (pcase key
-      (?f (org-dayflow-display))
+      ((or ?f ?\r ?\n) (org-dayflow-display))
       (?t (org-dayflow-display 'ten-min))
       (?h (org-dayflow-display 'hour))
       (?d (org-dayflow-display 'day))
