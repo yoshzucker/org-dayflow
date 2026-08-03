@@ -123,6 +123,14 @@ Keys ending in `-done` are used for completed tasks."
   :type '(alist :key-type (symbol) :value-type face)
   :group 'org-dayflow)
 
+(defcustom org-dayflow-category-faces nil
+  "Alist mapping an entry's CATEGORY (a string) to a face for its title line.
+When set, entries are colored by source (e.g. distinguishing calendars) rather
+than only by time type.  Empty by default -- no category coloring -- so this is
+a generic hook; populate it in your own configuration, not in the package."
+  :type '(alist :key-type string :value-type face)
+  :group 'org-dayflow)
+
 (defcustom org-dayflow-high-density nil
   "If non-nil, render with less vertical padding:
 - no blank line after the query line
@@ -1052,6 +1060,7 @@ derived from the earliest active timestamp in the entry."
                              (org-dayflow--datetime-max working-dts))))
            (occ (org-dayflow--earliest-active-datetime-range)))
       `(:title ,title :marker ,marker :todo ,todo
+               :category ,(org-entry-get (point) "CATEGORY")
                :scheduled ,scheduled :deadline ,deadline
                :working-start ,working-start :working-end ,working-end
                :occupation-start ,(car occ) :occupation-end ,(cdr occ)))))
@@ -1068,6 +1077,11 @@ derived from the earliest active timestamp in the entry."
           (when (and (<= 0 offset) (< offset units))
             offset))))))
 
+(defun org-dayflow--category-face (task)
+  "Face for TASK's category per `org-dayflow-category-faces', or nil."
+  (let ((cat (plist-get task :category)))
+    (and cat (cdr (assoc cat org-dayflow-category-faces)))))
+
 (defun org-dayflow--insert-title (task offset unit-char-width)
   "Insert the task title at the given unit OFFSET."
   (cl-destructuring-bind (&key title marker &allow-other-keys) task
@@ -1076,12 +1090,13 @@ derived from the earliest active timestamp in the entry."
            (line (propertize
                   (concat prefix "*" title)
                   'org-marker marker
-                  'face (if done
-                            'org-dayflow-title-done-face
-                          (with-current-buffer (marker-buffer marker)
-                            (save-excursion
-                              (goto-char marker)
-                              (org-dayflow--get-heading-face)))))))
+                  'face (cond
+                         (done 'org-dayflow-title-done-face)
+                         ((org-dayflow--category-face task))
+                         (t (with-current-buffer (marker-buffer marker)
+                              (save-excursion
+                                (goto-char marker)
+                                (org-dayflow--get-heading-face))))))))
       (insert line "\n"))))
 
 (defun org-dayflow--range-region (start-dt end-dt view-start units unit-char-width)
