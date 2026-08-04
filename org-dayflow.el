@@ -267,8 +267,8 @@ cursor currently sits on, and redrawn on every cursor movement."
   :group 'org-dayflow)
 
 (defface org-dayflow-title-done-face
-  '((t (:inherit org-headline-done)))
-  "Face for DONE or CANCELLED task titles."
+  '((t (:inherit org-headline-done :strike-through t)))
+  "Face for done-state (DONE/CANCEL/DELEG) task titles."
   :group 'org-dayflow)
 
 (defvar-local org-dayflow--current-scale nil
