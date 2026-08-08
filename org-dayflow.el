@@ -2,7 +2,7 @@
 
 ;; Author: yoshzucker
 ;; Maintainer: yoshzucker
-;; Version: 0.2
+;; Version: 0.3
 ;; Package-Requires: ((emacs "26.1") (org "9.1"))
 ;; Keywords: org, calendar, timeline
 ;; URL: https://github.com/yoshzucker/org-dayflow
@@ -35,6 +35,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'calendar)
 (require 'org)
 
 (defgroup org-dayflow nil
@@ -88,11 +89,21 @@
                 :value-type integer)
   :group 'org-dayflow)
 
-(defcustom org-dayflow-initial-query '((or (scheduled) (deadline) (regexp org-ts-regexp)))
+(defcustom org-dayflow-initial-query
+  '((and (or (scheduled) (deadline) (regexp org-ts-regexp))
+         (not (done))))
   "Default S-expression query for org-dayflow when no filters are applied.
-The query language is a subset of what org-ql supports and is evaluated
-internally using only Org primitives."
+The query language is a small subset evaluated with Org primitives.
+Default hides done-type states via `(not (done))'; pick a preset
+from query select (`/' then `s') to include DONE/CANCEL/DELEG."
   :type 'sexp
+  :group 'org-dayflow)
+
+(defcustom org-dayflow-column-bands t
+  "If non-nil, shade weekend columns on the day scale (single subtle face).
+Helps keep a sense of weekday vs weekend when the unit header has
+scrolled out of view.  Other scales leave columns unshaded."
+  :type 'boolean
   :group 'org-dayflow)
 
 (defcustom org-dayflow-saved-queries nil
@@ -106,9 +117,19 @@ Each entry is a cons cell of the form (LABEL . QUERY)."
   '((deadline  . "#")
     (active    . "*")
     (scheduled . "+"))
-  "Symbols used to represent different types of tasks in the vertical bar graph."
+  "Legacy symbols for the old multi-row histogram (unused).
+Kept so existing user customizations do not error; the load graph is
+now drawn with `org-dayflow-spark-chars'."
   :type '(alist :key-type (choice (const deadline) (const active) (const scheduled))
                 :value-type string)
+  :group 'org-dayflow)
+
+(defcustom org-dayflow-spark-chars "▁▂▃▄▅▆▇█"
+  "Block glyphs (U+2581..U+2588) for the per-unit load sparkline.
+Cell height encodes task count relative to the busiest unit in view.
+Same family of characters used by typical Nerd Font / monospaced
+sparklines (e.g. agenda embedded graphs)."
+  :type 'string
   :group 'org-dayflow)
 
 (defcustom org-dayflow-histogram-face-alist
@@ -118,8 +139,10 @@ Each entry is a cons cell of the form (LABEL . QUERY)."
     (deadline-done   . org-dayflow-histogram-deadline-done-face)
     (active-done     . org-dayflow-histogram-active-done-face)
     (scheduled-done  . org-dayflow-histogram-scheduled-done-face))
-  "Faces used to colorize task bars in the vertical bar graph.
-Keys ending in `-done` are used for completed tasks."
+  "Faces used to colorize the load sparkline per unit.
+Keys ending in `-done` are used when every task in that unit is done.
+Otherwise the dominant incomplete type (deadline > active > scheduled)
+selects the face."
   :type '(alist :key-type (symbol) :value-type face)
   :group 'org-dayflow)
 
@@ -134,7 +157,18 @@ a generic hook; populate it in your own configuration, not in the package."
 (defcustom org-dayflow-high-density nil
   "If non-nil, render with less vertical padding:
 - no blank line after the query line
-- no blank line between histogram and titles."
+- no blank line between the load sparkline and titles."
+  :type 'boolean
+  :group 'org-dayflow)
+
+(defcustom org-dayflow-sticky-header nil
+  "If non-nil, keep the timeline header (query, labels, units, sparkline)
+visible in a fixed upper window while task rows scroll below.
+
+Default is nil: the dual-window sticky approach is experimental and
+can leave a lone header window when the body window is deleted.
+Prefer filter / per-row date cues over sticky until a more robust
+design lands.  Set non-nil only for explicit sticky trials."
   :type 'boolean
   :group 'org-dayflow)
 
@@ -188,6 +222,19 @@ Used to restore the previous layout when quitting with
 (defface org-dayflow-weekend-face
   '((t (:inherit org-agenda-structure :weight bold)))
   "Face for weekends in org-dayflow (only relevant for day scale)."
+  :group 'org-dayflow)
+
+(defface org-dayflow-weekend-column-face
+  '((((class color) (min-colors 88) (background light))
+     :background "gray96" :extend t)
+    (((class color) (min-colors 88) (background dark))
+     ;; Soft fallback only; themes (e.g. gensho) should remap via mono/dim ramp.
+     :background "gray16" :extend t)
+    (t :extend t))
+  "Subtle full-height column shade for weekend units on day scale.
+Applied behind title / sparkline content so schedule stays readable.
+Prefer theme-local remapping onto a one-step mono/dim ramp rather than
+a high-contrast gray."
   :group 'org-dayflow)
 
 (defface org-dayflow-now-unit-face
@@ -293,7 +340,19 @@ cursor currently sits on, and redrawn on every cursor movement."
   "Buffer position of the beginning of the unit-label row.")
 
 (defvar-local org-dayflow--grid-start nil
-  "Buffer position where histogram / task rows begin (after label rows).")
+  "Buffer position where sparkline / task rows begin (after label rows).")
+
+(defvar-local org-dayflow--body-start nil
+  "Buffer position of the first task row (start of the scrollable body).")
+
+(defvar-local org-dayflow--header-line-count 0
+  "Number of buffer lines in the sticky header region.")
+
+(defvar-local org-dayflow--header-window nil
+  "Window showing the sticky header, or nil.")
+
+(defvar-local org-dayflow--body-window nil
+  "Window showing the scrollable task body, or nil.")
 
 (defvar-local org-dayflow--cursor-column-overlays nil
   "List of overlays highlighting the cursor's cell column across grid rows.")
@@ -323,6 +382,8 @@ cursor currently sits on, and redrawn on every cursor movement."
     (define-key map (kbd ".") #'org-dayflow-offset-reset)
     (define-key map (kbd "h") #'org-dayflow-scroll-right)
     (define-key map (kbd "l") #'org-dayflow-scroll-left)
+    ;; `/' matches org-agenda-filter; `]' kept as a legacy alias.
+    (define-key map (kbd "/") #'org-dayflow-filter-dispatch)
     (define-key map (kbd "]") #'org-dayflow-filter-dispatch)
     (define-key map (kbd "f") #'org-dayflow-toggle-follow)
     (define-key map (kbd "s") #'org-dayflow-schedule)
@@ -827,11 +888,38 @@ and the atomic forms understood by `org-dayflow--query-atom-matches-p'."
       (org-dayflow--query-atom-matches-p query)))
    (t nil)))
 
+(defun org-dayflow--timestamp-on-day-p (ts-string month day year)
+  "Return non-nil if TS-STRING falls on calendar day MONTH/DAY/YEAR."
+  (let ((dt (org-dayflow--datetime-timestamp ts-string)))
+    (and dt
+         (= (nth 0 dt) month)
+         (= (nth 1 dt) day)
+         (= (nth 2 dt) year))))
+
+(defun org-dayflow--entry-on-day-p (month day year)
+  "Return non-nil if the heading at point is dated on MONTH/DAY/YEAR.
+Matches SCHEDULED, DEADLINE, or the first active TIMESTAMP day."
+  (or (org-dayflow--timestamp-on-day-p
+       (org-entry-get nil "SCHEDULED") month day year)
+      (org-dayflow--timestamp-on-day-p
+       (org-entry-get nil "DEADLINE") month day year)
+      (org-dayflow--timestamp-on-day-p
+       (org-entry-get nil "TIMESTAMP") month day year)))
+
 (defun org-dayflow--query-atom-matches-p (atom)
   "Return non-nil if the atomic query form ATOM matches the heading at point."
   (pcase atom
     (`(scheduled) (not (null (org-entry-get nil "SCHEDULED"))))
     (`(deadline)  (not (null (org-entry-get nil "DEADLINE"))))
+    (`(done)
+     ;; Mirror `org-dayflow--task-done-p' / Org done keywords for the
+     ;; heading at point (covers DONE, CANCEL, DELEG, etc.).
+     (let* ((todo (org-get-todo-state))
+            (done-kws (or (bound-and-true-p org-done-keywords-for-agenda)
+                          (bound-and-true-p org-done-keywords))))
+       (and todo done-kws (member todo done-kws))))
+    (`(on-day ,month ,day ,year)
+     (org-dayflow--entry-on-day-p month day year))
     (`(tags ,tag) (member tag (org-get-tags)))
     (`(todo ,kw)  (string= (org-get-todo-state) kw))
     (`(property ,prop ,val)
@@ -850,6 +938,85 @@ and the atomic forms understood by `org-dayflow--query-atom-matches-p'."
          (let ((end (save-excursion (or (outline-next-heading) (point-max)))))
            (re-search-forward re end t)))))
     (_ nil)))
+
+(defun org-dayflow--unit-index-to-datetime (unit)
+  "Return (month day year hour minute) for UNIT index in the current view."
+  (let ((start (org-dayflow--date-start)))
+    (pcase org-dayflow--current-scale
+      ('day
+       (let* ((start-abs (calendar-absolute-from-gregorian start))
+              (g (calendar-gregorian-from-absolute (+ start-abs unit))))
+         (list (nth 0 g) (nth 1 g) (nth 2 g) 0 0)))
+      ('week
+       (let* ((start-abs (calendar-absolute-from-gregorian start))
+              (g (calendar-gregorian-from-absolute (+ start-abs (* unit 7)))))
+         (list (nth 0 g) (nth 1 g) (nth 2 g) 0 0)))
+      ('ten-min
+       (org-dayflow--minutes-to-datetime
+        (+ (org-dayflow--datetime-to-minutes start) (* unit 10))))
+      ('hour
+       (org-dayflow--minutes-to-datetime
+        (+ (org-dayflow--datetime-to-minutes start) (* unit 60))))
+      ('month
+       (org-dayflow--date+ start (list unit 0 0)))
+      ('year
+       (org-dayflow--date+ start (list 0 0 unit)))
+      ('decade
+       (org-dayflow--date+ start (list 0 0 (* unit 10))))
+      (_
+       (let* ((start-abs (calendar-absolute-from-gregorian start))
+              (g (calendar-gregorian-from-absolute (+ start-abs unit))))
+         (list (nth 0 g) (nth 1 g) (nth 2 g) 0 0))))))
+
+(defun org-dayflow--format-datetime-short (dt)
+  "Format DT (month day year ...) as \"YYYY-MM-DD Day\"."
+  (when dt
+    (let* ((month (nth 0 dt))
+           (day (nth 1 dt))
+           (year (nth 2 dt))
+           (dow (calendar-day-of-week (list month day year)))
+           (name (aref calendar-day-name-array dow)))
+      (format "%04d-%02d-%02d %s" year month day (substring name 0 3)))))
+
+(defun org-dayflow--task-anchor-datetime (task)
+  "Datetime used to place TASK on the timeline (deadline > active > scheduled)."
+  (cl-destructuring-bind (&key scheduled deadline occupation-start
+                               &allow-other-keys) task
+    (or (org-dayflow--datetime-timestamp deadline)
+        occupation-start
+        (org-dayflow--datetime-timestamp scheduled))))
+
+(defun org-dayflow--query-for-unit-at-point ()
+  "Build a query restricting to the calendar day of the unit under point.
+On day scale this is a true day filter; on coarser/finer scales it uses
+the unit's start day via `on-day'."
+  (let ((cell (org-dayflow--cursor-cell)))
+    (unless cell
+      (user-error "No unit under point"))
+    (let* ((dt (org-dayflow--unit-index-to-datetime cell))
+           (day-q `(on-day ,(nth 0 dt) ,(nth 1 dt) ,(nth 2 dt))))
+      `(and (or (scheduled) (deadline) (regexp org-ts-regexp))
+            ,day-q))))
+
+(defun org-dayflow--builtin-query-presets ()
+  "Alist of (LABEL . QUERY) built-in presets for query selection.
+QUERY may also be the symbol `unit-at-point', resolved at apply time."
+  (list
+   (cons "[preset]: open + dated (default)"
+         '((and (or (scheduled) (deadline) (regexp org-ts-regexp))
+                (not (done)))))
+   (cons "[preset]: all dated (include done)"
+         '((or (scheduled) (deadline) (regexp org-ts-regexp))))
+   (cons "[preset]: open only (any heading)"
+         '((not (done))))
+   (cons "[preset]: done only"
+         '((done)))
+   (cons "[preset]: unit at point"
+         'unit-at-point)
+   (cons "[preset]: scheduled"
+         '((and (scheduled) (not (done)))))
+   (cons "[preset]: deadline"
+         '((and (deadline) (not (done)))))))
 
 (defun org-dayflow--read-filter-char (type)
   "Prompt for a filter command: +, -, TAB to select filter type, \\ to clear, . to filter at point, q to quit."
@@ -990,49 +1157,73 @@ Display MESSAGE along with the timestamp."
                                                  (cl-subseq kws (1+ sep)))))))))
     (and todo (member todo done-keywords))))
 
-(defun org-dayflow--char-type (char &optional done)
-  "Return task type symbol for CHAR. If DONE is non-nil, return '-done' variant."
-  (let ((base (car (rassoc char org-dayflow-histogram-char-alist))))
-    (if (and base done)
-        (intern (format "%s-done" base))
-      base)))
+(defun org-dayflow--spark-char (frac)
+  "Return a `org-dayflow-spark-chars' glyph for FRAC in [0.0, 1.0].
+FRAC <= 0 yields nil (caller inserts a blank cell)."
+  (when (> frac 0.0)
+    (let ((n (1- (length org-dayflow-spark-chars))))
+      (when (>= n 0)
+        (aref org-dayflow-spark-chars
+              (max 0 (min n (round (* frac n)))))))))
 
-(defun org-dayflow--insert-histogram (tasks start units unit-char-width)
-  "Insert a 2-column histogram per unit: left = incomplete, right = complete."
-  (let ((incomplete-stacks (make-vector units nil))
-        (complete-stacks (make-vector units nil)))
+(defun org-dayflow--type-priority (type)
+  "Lower number = higher priority for dominant-type selection."
+  (pcase type
+    ('deadline 0)
+    ('active 1)
+    ('scheduled 2)
+    (_ 3)))
+
+(defun org-dayflow--dominant-type (types)
+  "Return the highest-priority type symbol in TYPES, or nil if empty."
+  (car (cl-sort (copy-sequence types) #'< :key #'org-dayflow--type-priority)))
+
+(defun org-dayflow--spark-face (incomplete-types done-types)
+  "Face for a sparkline cell from incomplete/done type lists."
+  (let* ((key (cond
+               (incomplete-types (org-dayflow--dominant-type incomplete-types))
+               (done-types
+                (intern (format "%s-done"
+                                (org-dayflow--dominant-type done-types))))
+               (t nil))))
+    (and key (alist-get key org-dayflow-histogram-face-alist))))
+
+(defun org-dayflow--insert-sparkline (tasks start units unit-char-width)
+  "Insert a one-line load sparkline: one block glyph per unit.
+
+Height encodes how many tasks land on that unit (relative to the
+busiest unit in view).  Face encodes dominant task type (incomplete
+preferred; otherwise a done-face variant)."
+  (let ((counts (make-vector units 0))
+        (incomplete-types (make-vector units nil))
+        (done-types (make-vector units nil)))
     (dolist (task tasks)
-      (let* ((unit (org-dayflow--title-position task start units))
-             (type (org-dayflow--task-type task))
-             (done (org-dayflow--task-done-p task))
-             (char (alist-get type org-dayflow-histogram-char-alist)))
+      (let ((unit (org-dayflow--title-position task start units)))
         (when unit
-          (let ((stacks (if done complete-stacks incomplete-stacks)))
-            (aset stacks unit (cons char (aref stacks unit)))))))
-    (let ((height (cl-loop for i below units
-                           maximize (max 1
-                                         (length (aref incomplete-stacks i))
-                                         (length (aref complete-stacks i))))))
-      (dotimes (row height)
-        (dotimes (unit units)
-          (let ((stack (aref incomplete-stacks unit)))
-            (if stack
-                (let ((char (car stack)))
-                  (insert (propertize char
-                                      'face (alist-get (org-dayflow--char-type char nil)
-                                                       org-dayflow-histogram-face-alist)))
-                  (aset incomplete-stacks unit (cdr stack)))
-              (insert " ")))
-          (let ((stack (aref complete-stacks unit)))
-            (if stack
-                (let ((char (car stack)))
-                  (insert (propertize char
-                                      'face (alist-get (org-dayflow--char-type char t)
-                                                       org-dayflow-histogram-face-alist)))
-                  (aset complete-stacks unit (cdr stack)))
-              (insert " ")))
-          (insert (make-string (- unit-char-width 2) ?\s)))
-        (insert "\n")))))
+          (aset counts unit (1+ (aref counts unit)))
+          (let* ((type (org-dayflow--task-type task))
+                 (done (org-dayflow--task-done-p task))
+                 (bucket (if done done-types incomplete-types)))
+            (aset bucket unit (cons type (aref bucket unit)))))))
+    (let ((max-count (or (cl-loop for i below units
+                                  maximize (aref counts i))
+                         0)))
+      (dotimes (unit units)
+        (let* ((count (aref counts unit))
+               (frac (if (and max-count (> max-count 0))
+                         (/ (float count) max-count)
+                       0.0))
+               (glyph (org-dayflow--spark-char frac))
+               (face (org-dayflow--spark-face
+                      (aref incomplete-types unit)
+                      (aref done-types unit)))
+               (cell (if glyph
+                         (let ((s (char-to-string glyph)))
+                           (if face (propertize s 'face face) s))
+                       " ")))
+          (insert cell)
+          (insert (make-string (max 0 (- unit-char-width 1)) ?\s))))
+      (insert "\n"))))
 
 (defun org-dayflow--extract-task ()
   "Create a task plist from the current Org heading.
@@ -1083,21 +1274,29 @@ derived from the earliest active timestamp in the entry."
     (and cat (cdr (assoc cat org-dayflow-category-faces)))))
 
 (defun org-dayflow--insert-title (task offset unit-char-width)
-  "Insert the task title at the given unit OFFSET."
+  "Insert the task title at the given unit OFFSET.
+
+Padding spaces left of the title have no face, so strike-through
+on done titles does not extend into empty columns.  `org-marker'
+is applied to the whole line (including padding) so next/previous
+item navigation still finds the row from column 0."
   (cl-destructuring-bind (&key title marker &allow-other-keys) task
-    (let* ((prefix (make-string (* offset unit-char-width) ?\s))
+    (let* ((bol (point))
+           (prefix (make-string (* offset unit-char-width) ?\s))
            (done (org-dayflow--task-done-p task))
-           (line (propertize
-                  (concat prefix "*" title)
-                  'org-marker marker
-                  'face (cond
-                         (done 'org-dayflow-title-done-face)
-                         ((org-dayflow--category-face task))
-                         (t (with-current-buffer (marker-buffer marker)
-                              (save-excursion
-                                (goto-char marker)
-                                (org-dayflow--get-heading-face))))))))
-      (insert line "\n"))))
+           (face (cond
+                  (done 'org-dayflow-title-done-face)
+                  ((org-dayflow--category-face task))
+                  (t (with-current-buffer (marker-buffer marker)
+                       (save-excursion
+                         (goto-char marker)
+                         (org-dayflow--get-heading-face)))))))
+      (insert prefix)
+      (let ((label-start (point)))
+        (insert "*" title)
+        (add-text-properties label-start (point) (list 'face face)))
+      (put-text-property bol (point) 'org-marker marker)
+      (insert "\n"))))
 
 (defun org-dayflow--range-region (start-dt end-dt view-start units unit-char-width)
   "Return (BAR-POS-START . BAR-POS-END) of the character span covering
@@ -1150,6 +1349,37 @@ START-DT equals END-DT (single-point), one cell is filled."
     (add-face-text-property (car region) (cdr region)
                             'org-dayflow-title-occupation-face)))
 
+(defun org-dayflow--paint-column-face (grid-start unit units unit-char-width face)
+  "Apply FACE to UNIT's cell on every grid row from GRID-START (APPEND).
+No-op when UNIT is outside [0, UNITS)."
+  (when (and (<= 0 unit) (< unit units))
+    (let ((left-col  (* unit unit-char-width))
+          (right-col (* (1+ unit) unit-char-width)))
+      (save-excursion
+        (goto-char grid-start)
+        (while (not (eobp))
+          (beginning-of-line)
+          (move-to-column left-col t)
+          (let ((start-pos (point)))
+            (move-to-column right-col t)
+            (add-face-text-property start-pos (point) face t))
+          (forward-line 1))))))
+
+(defun org-dayflow--draw-column-bands (grid-start view-start units unit-char-width)
+  "Shade weekend columns on day scale when `org-dayflow-column-bands' is set.
+Uses a single face (`org-dayflow-weekend-column-face') so the cue stays
+simple: denser shade = Saturday/Sunday."
+  (when (and org-dayflow-column-bands
+             (eq org-dayflow--current-scale 'day))
+    (let ((start-abs (calendar-absolute-from-gregorian view-start)))
+      (dotimes (unit units)
+        (let* ((date (calendar-gregorian-from-absolute (+ start-abs unit)))
+               (dow (calendar-day-of-week date)))
+          (when (or (= dow 0) (= dow 6))
+            (org-dayflow--paint-column-face
+             grid-start unit units unit-char-width
+             'org-dayflow-weekend-column-face)))))))
+
 (defun org-dayflow--draw-now-column (grid-start view-start units unit-char-width)
   "Paint the now-column face across every grid row from GRID-START.
 No-op when the current time falls outside the view.
@@ -1161,19 +1391,9 @@ APPEND = t so any pre-existing face (title / occupation / box)
 keeps priority in the merged `face' text property."
   (let ((now-cell (org-dayflow--title-unit
                    view-start (org-dayflow--datetime-now))))
-    (when (and (<= 0 now-cell) (< now-cell units))
-      (let ((left-col  (* now-cell unit-char-width))
-            (right-col (* (1+ now-cell) unit-char-width)))
-        (save-excursion
-          (goto-char grid-start)
-          (while (not (eobp))
-            (beginning-of-line)
-            (move-to-column left-col t)
-            (let ((start-pos (point)))
-              (move-to-column right-col t)
-              (add-face-text-property start-pos (point)
-                                      'org-dayflow-now-column-face t))
-            (forward-line 1)))))))
+    (org-dayflow--paint-column-face
+     grid-start now-cell units unit-char-width
+     'org-dayflow-now-column-face)))
 
 (defun org-dayflow--cursor-cell ()
   "Return the unit cell index the cursor currently sits on, or nil if outside."
@@ -1229,6 +1449,37 @@ overlays without ever modifying the read-only buffer."
     (delete-overlay org-dayflow--cursor-unit-overlay))
   (setq org-dayflow--cursor-unit-overlay nil))
 
+(defun org-dayflow--header-line-string ()
+  "Return a compact context string for `header-line-format'."
+  (let* ((cell (org-dayflow--cursor-cell))
+         (unit-dt (and cell (org-dayflow--unit-index-to-datetime cell)))
+         (marker (get-text-property (point) 'org-marker))
+         (task-dt
+          (when (and marker (marker-buffer marker))
+            (with-current-buffer (marker-buffer marker)
+              (save-excursion
+                (goto-char marker)
+                (or (org-dayflow--datetime-timestamp
+                     (org-entry-get nil "DEADLINE"))
+                    (car (org-dayflow--earliest-active-datetime-range))
+                    (org-dayflow--datetime-timestamp
+                     (org-entry-get nil "SCHEDULED")))))))
+         (parts (delq nil
+                      (list
+                       (when unit-dt
+                         (format "col %s" (org-dayflow--format-datetime-short unit-dt)))
+                       (when task-dt
+                         (format "task %s" (org-dayflow--format-datetime-short task-dt)))
+                       (format "scale %s" org-dayflow--current-scale)))))
+    (mapconcat #'identity parts "  |  ")))
+
+(defun org-dayflow--update-header-line ()
+  "Refresh `header-line-format' with column / task date context."
+  (when (derived-mode-p 'org-dayflow-mode)
+    (setq header-line-format
+          (list " "
+                '(:eval (org-dayflow--header-line-string))))))
+
 (defun org-dayflow--update-cursor-highlight ()
   "Redraw cursor column / unit overlays for the current cursor position.
 Assumes `org-dayflow--render' pre-padded every grid row and the
@@ -1238,6 +1489,8 @@ to keep alignment correct on rows containing multi-column
 characters."
   (when (derived-mode-p 'org-dayflow-mode)
     (org-dayflow--clear-cursor-highlight)
+    (org-dayflow--update-header-line)
+    (force-mode-line-update)
     (let ((cell (org-dayflow--cursor-cell))
           (grid org-dayflow--grid-start)
           (unit org-dayflow--unit-line-start))
@@ -1284,7 +1537,7 @@ characters."
                'face 'org-dayflow-query-face))
       (insert (if org-dayflow-high-density "\n" "\n\n"))
       (org-dayflow--clear-cursor-highlight)
-      (let (unit-line-start grid-start)
+      (let (unit-line-start grid-start body-start)
         (dolist (line label-lines)
           (when line
             (setq unit-line-start (point))
@@ -1294,8 +1547,9 @@ characters."
             (goto-char unit-line-start)
             (org-dayflow--pad-line-to-column (* units unit-char-width))))
         (setq grid-start (point))
-        (org-dayflow--insert-histogram tasks start units unit-char-width)
+        (org-dayflow--insert-sparkline tasks start units unit-char-width)
         (unless org-dayflow-high-density (insert "\n"))
+        (setq body-start (point))
         (dolist (task tasks)
           (let ((offset (org-dayflow--title-position task start units)))
             (when offset
@@ -1305,17 +1559,157 @@ characters."
           (org-dayflow--draw-working-box
            (org-dayflow--working-region task start units unit-char-width)))
         (org-dayflow--pad-grid-to-full-width grid-start units unit-char-width)
+        ;; Bands first (lowest visual priority), then now-column on top.
+        (org-dayflow--draw-column-bands grid-start start units unit-char-width)
         (org-dayflow--draw-now-column grid-start start units unit-char-width)
         (setq org-dayflow--unit-line-start unit-line-start)
-        (setq org-dayflow--grid-start grid-start))
-      (goto-char (point-min)))))
+        (setq org-dayflow--grid-start grid-start)
+        (setq org-dayflow--body-start body-start)
+        (setq org-dayflow--header-line-count
+              (max 0 (count-lines (point-min) body-start))))
+      (goto-char (or org-dayflow--body-start (point-min)))
+      (org-dayflow--update-header-line))))
+
+;;; Sticky header (fixed upper window + scrollable body)
+
+(defvar org-dayflow--in-scroll-guard nil
+  "Non-nil while `org-dayflow--scroll-guard' is adjusting window-start.")
+
+(defun org-dayflow--scroll-guard (window _new-start)
+  "Keep sticky header frozen and body start clamped on WINDOW."
+  (unless org-dayflow--in-scroll-guard
+    (when (window-live-p window)
+      (let ((org-dayflow--in-scroll-guard t)
+            (role (window-parameter window 'org-dayflow-role)))
+        (cond
+         ((eq role 'header)
+          (set-window-start window (point-min) t)
+          (set-window-vscroll window 0))
+         ((eq role 'body)
+          (with-current-buffer (window-buffer window)
+            (when (and org-dayflow--body-start
+                       (< (window-start window) org-dayflow--body-start))
+              (set-window-start window org-dayflow--body-start t)))))))))
+
+(defun org-dayflow--ensure-body-selected ()
+  "When sticky dual-window is active, keep point out of the header window.
+
+With sticky disabled (the default), do not clamp point: clamping to
+`org-dayflow--body-start' prevented scrolling back up to the unit row
+with `k' / previous-item after `j' had pushed the header off-screen."
+  (when (and org-dayflow-sticky-header
+             (window-live-p org-dayflow--header-window)
+             (window-live-p org-dayflow--body-window))
+    (when (eq (selected-window) org-dayflow--header-window)
+      (select-window org-dayflow--body-window))
+    (when (and org-dayflow--body-start
+               (derived-mode-p 'org-dayflow-mode)
+               (< (point) org-dayflow--body-start))
+      (goto-char org-dayflow--body-start))))
+
+(defun org-dayflow--first-item-position ()
+  "Buffer position of the first task line, or nil."
+  (when org-dayflow--body-start
+    (save-excursion
+      (goto-char org-dayflow--body-start)
+      (while (and (not (eobp))
+                  (not (get-text-property (point) 'org-marker)))
+        (forward-line 1))
+      (and (get-text-property (point) 'org-marker) (point)))))
+
+(defun org-dayflow--at-first-item-p ()
+  "Return non-nil if point is on the first task row."
+  (let ((first (org-dayflow--first-item-position)))
+    (and first
+         (get-text-property (point) 'org-marker)
+         (= (line-beginning-position)
+            (save-excursion (goto-char first) (line-beginning-position))))))
+
+(defun org-dayflow--timeline-header-obscured-p ()
+  "Non-nil when the window start is below the buffer top (header scrolled away)."
+  (> (window-start) (point-min)))
+
+(defun org-dayflow--reveal-timeline-header ()
+  "Scroll so query / units / sparkline are visible; keep point on a task.
+
+Used when previous-item has nowhere left to go, or lands on the first
+task while the header is off-screen."
+  (let ((win (selected-window))
+        (task (or (and (get-text-property (point) 'org-marker) (point))
+                  (org-dayflow--first-item-position))))
+    (set-window-start win (point-min) t)
+    (when task
+      (goto-char task)
+      (org-dayflow--move-to-title))))
+
+(defun org-dayflow--teardown-sticky-windows ()
+  "Remove the sticky header split; leave one window on this buffer."
+  (let ((header org-dayflow--header-window)
+        (body org-dayflow--body-window)
+        (buf (current-buffer)))
+    (setq org-dayflow--header-window nil
+          org-dayflow--body-window nil)
+    (when (and (window-live-p header) (window-live-p body))
+      (when (eq (selected-window) header)
+        (select-window body))
+      (delete-window header))
+    (dolist (w (get-buffer-window-list buf nil t))
+      (set-window-parameter w 'org-dayflow-role nil)
+      (set-window-parameter w 'no-other-window nil))))
+
+(defun org-dayflow--setup-sticky-windows ()
+  "Split a fixed header window above the scrollable task body.
+
+No-op when `org-dayflow-sticky-header' is nil or the buffer has no
+body region.  Safe to call repeatedly (tears down any previous split)."
+  (org-dayflow--teardown-sticky-windows)
+  (when (and org-dayflow-sticky-header
+             (derived-mode-p 'org-dayflow-mode)
+             org-dayflow--body-start
+             (> org-dayflow--header-line-count 0))
+    (let* ((buf (current-buffer))
+           (body-win (or (get-buffer-window buf) (selected-window)))
+           (header-lines org-dayflow--header-line-count)
+           header-win)
+      (when (and (window-live-p body-win)
+                 (eq (window-buffer body-win) buf)
+                 ;; Need room for header + at least one body line.
+                 (> (window-total-height body-win) (1+ header-lines)))
+        (select-window body-win)
+        ;; Negative SIZE = height of the new window (Emacs split-window API).
+        (setq header-win (split-window body-win (- header-lines) 'above))
+        (set-window-buffer header-win buf)
+        (set-window-buffer body-win buf)
+        (set-window-parameter header-win 'org-dayflow-role 'header)
+        (set-window-parameter body-win 'org-dayflow-role 'body)
+        ;; Skip header when cycling other-window.
+        (set-window-parameter header-win 'no-other-window t)
+        (set-window-start header-win (point-min) t)
+        (set-window-point header-win (point-min))
+        (set-window-vscroll header-win 0)
+        (set-window-start body-win org-dayflow--body-start t)
+        (set-window-point body-win
+                          (max org-dayflow--body-start
+                               (min (point-max) (window-point body-win))))
+        ;; Lock header height after split (split-window uses line count
+        ;; in body-lines units; re-fit in case of mode-line differences).
+        (let ((delta (- header-lines (window-body-height header-win))))
+          (when (and (/= delta 0)
+                     (> (+ (window-total-height header-win) delta) 1))
+            (window-resize header-win delta nil nil t)))
+        (setq org-dayflow--header-window header-win
+              org-dayflow--body-window body-win)
+        (select-window body-win)
+        (when (< (point) org-dayflow--body-start)
+          (goto-char org-dayflow--body-start))))))
 
 ;;; User commands
 (defun org-dayflow-refresh ()
   "Refresh the current org-dayflow buffer."
   (interactive)
   (when (derived-mode-p 'org-dayflow-mode)
-    (org-dayflow--render)))
+    (org-dayflow--render)
+    (org-dayflow--setup-sticky-windows)))
 
 (defun org-dayflow-scale-zoom-out ()
   "Increase org-dayflow scale (zoom out) by moving to the next broader unit."
@@ -1363,19 +1757,38 @@ characters."
       (org-dayflow--highlight-current-heading marker))))
 
 (defun org-dayflow-previous-item (n)
-  "Move to the previous N-th item in the org-dayflow buffer."
+  "Move to the previous N-th item in the org-dayflow buffer.
+
+If there is no previous task, or the first task is already selected
+while the unit header is scrolled out of view, scroll so the
+timeline header (query / units / sparkline) becomes visible again
+without leaving point stranded above the task rows."
   (interactive "p")
-  (dotimes (_ n)
-    (forward-line -1)
-    (while (and (not (bobp))
-                (not (get-text-property (point) 'org-marker)))
-      (forward-line -1)))
-  (org-dayflow--move-to-title)
-  (org-dayflow-echo-info)
-  (when org-dayflow--follow-mode
-    (let ((marker (get-text-property (point) 'org-marker)))
-      (org-dayflow--follow)
-      (org-dayflow--highlight-current-heading marker))))
+  (let ((moved nil))
+    (dotimes (_ n)
+      (let ((before (point)))
+        (forward-line -1)
+        (while (and (not (bobp))
+                    (not (get-text-property (point) 'org-marker)))
+          (forward-line -1))
+        (if (get-text-property (point) 'org-marker)
+            (setq moved t)
+          (goto-char before))))
+    (cond
+     (moved
+      (org-dayflow--move-to-title)
+      (when (and (org-dayflow--at-first-item-p)
+                 (org-dayflow--timeline-header-obscured-p))
+        (org-dayflow--reveal-timeline-header))
+      (org-dayflow-echo-info)
+      (when org-dayflow--follow-mode
+        (let ((marker (get-text-property (point) 'org-marker)))
+          (org-dayflow--follow)
+          (org-dayflow--highlight-current-heading marker))))
+     (t
+      (org-dayflow--reveal-timeline-header)
+      (org-dayflow-echo-info)
+      (message "Beginning of dayflow")))))
 
 (defun org-dayflow-scroll-left (n)
   "Scroll the current window left by N characters."
@@ -1442,10 +1855,17 @@ Use `q' which is bound to `org-dayflow-quit' for full window-restore support."
   (message "Follow mode %s" (if org-dayflow--follow-mode "enabled" "disabled")))
 
 (defun org-dayflow-echo-info ()
-  "Echo the Org path, todo state, tags, properties, and scheduling info of the current item."
+  "Echo the Org path, todo state, tags, properties, and scheduling info of the current item.
+Also prefixes the timeline column date under point when available."
   (interactive)
-  (let ((marker (get-text-property (point) 'org-marker)))
-    (when (and marker (marker-buffer marker))
+  (let* ((cell (org-dayflow--cursor-cell))
+         (col-dt (and cell (org-dayflow--unit-index-to-datetime cell)))
+         (col-str (when col-dt
+                    (format "COL:%s  "
+                            (org-dayflow--format-datetime-short col-dt))))
+         (marker (get-text-property (point) 'org-marker)))
+    (if (not (and marker (marker-buffer marker)))
+        (when col-str (message "%s" (string-trim-right col-str)))
       (with-current-buffer (marker-buffer marker)
         (save-excursion
           (goto-char marker)
@@ -1465,7 +1885,8 @@ Use `q' which is bound to `org-dayflow-quit' for full window-restore support."
                  (timestamp (org-entry-get (point) "TIMESTAMP")))
             (when todo
               (setq todo (propertize todo 'face (org-get-todo-face todo))))
-            (message "%s/%s%s%s%s%s"
+            (message "%s%s/%s%s%s%s%s"
+                     (or col-str "")
                      file
                      full-path
                      (if todo (format "  TODO:%s" todo) "")
@@ -1566,51 +1987,82 @@ Use `q' which is bound to `org-dayflow-quit' for full window-restore support."
   (setq org-dayflow--current-query nil)
   (org-dayflow-refresh))
 
+(defun org-dayflow--resolve-query-choice (kind payload)
+  "Return the query S-expression for KIND/PAYLOAD from query selection."
+  (pcase kind
+    ('preset
+     (if (eq payload 'unit-at-point)
+         (org-dayflow--query-for-unit-at-point)
+       payload))
+    ('saved (cdr payload))
+    ('session payload)
+    (_ payload)))
+
 (defun org-dayflow-select-query ()
-  "Select a query from saved and session history. "
+  "Select and apply a query: built-in presets, saved queries, or session history.
+
+Presets cover common views (open+dated, include done, unit at point).
+Choosing a preset or session entry applies it immediately; saved
+entries still offer apply / save / delete."
   (interactive)
-  (let* ((saved org-dayflow-saved-queries)
-         (session org-dayflow--query-session)
+  (let* ((presets
+          (mapcar (lambda (e)
+                    (cons (car e) (cons 'preset (cdr e))))
+                  (org-dayflow--builtin-query-presets)))
          (saved-labeled
           (mapcar (lambda (e)
-                    (let ((label (car e)))
-                      (cons (format "[saved]: %s" label) (cons 'saved e))))
-                  saved))
+                    (cons (format "[saved]: %s" (car e))
+                          (cons 'saved e)))
+                  org-dayflow-saved-queries))
          (session-labeled
           (mapcar (lambda (q)
-                    (cons (format "[session]: %s" (prin1-to-string q)) (cons 'session q)))
-                  session))
-         (all-entries (append saved-labeled session-labeled))
+                    (cons (format "[session]: %s" (prin1-to-string q))
+                          (cons 'session q)))
+                  org-dayflow--query-session))
+         (all-entries (append presets saved-labeled session-labeled))
          (choice (completing-read
-                  "Select query to act on: "
+                  "Select query: "
                   (mapcar #'car all-entries)
-                  nil t nil nil nil 'org-dayflow-query))
+                  nil t nil nil (caar presets)))
          (entry (cdr (assoc choice all-entries)))
          (kind (car entry))
-         (payload (cdr entry))
-         (action (read-key "Action: RET=apply  d=delete  s=save")))
-    (pcase action
-      (?\r
-       (setq org-dayflow--current-query (if (eq kind 'saved) (cdr payload) payload))
-       (org-dayflow-refresh))
-      (?s
-       (let ((query (if (eq kind 'saved) (cdr payload) payload))
-             (label (prin1-to-string (if (eq kind 'saved) (cdr payload) payload))))
-         (unless (assoc label org-dayflow-saved-queries)
-           (add-to-list 'org-dayflow-saved-queries (cons label query))
-           (customize-save-variable 'org-dayflow-saved-queries org-dayflow-saved-queries)
-           (message "Saved query: %s" label))))
-      (?d
-       (when (eq kind 'saved)
-         (let ((label (car payload)))
-           (setq org-dayflow-saved-queries
-                 (assoc-delete-all label org-dayflow-saved-queries))
-           (customize-save-variable 'org-dayflow-saved-queries org-dayflow-saved-queries)
-           (message "Deleted saved query: %s" label))))
-      (_ (message "Unknown action")))))
+         (payload (cdr entry)))
+    (if (memq kind '(preset session))
+        (let ((query (org-dayflow--resolve-query-choice kind payload)))
+          (setq org-dayflow--current-query query)
+          (unless (member query org-dayflow--query-session)
+            (push query org-dayflow--query-session))
+          (org-dayflow-refresh)
+          (message "Query: %s" (prin1-to-string query)))
+      ;; saved: keep apply / delete / save actions
+      (let ((action (read-key "Action: RET=apply  d=delete  s=save")))
+        (pcase action
+          (?\r
+           (let ((query (org-dayflow--resolve-query-choice kind payload)))
+             (setq org-dayflow--current-query query)
+             (org-dayflow-refresh)))
+          (?s
+           (let ((query (cdr payload))
+                 (label (car payload)))
+             (unless (assoc label org-dayflow-saved-queries)
+               (add-to-list 'org-dayflow-saved-queries (cons label query))
+               (customize-save-variable 'org-dayflow-saved-queries
+                                        org-dayflow-saved-queries)
+               (message "Saved query: %s" label))))
+          (?d
+           (let ((label (car payload)))
+             (setq org-dayflow-saved-queries
+                   (assoc-delete-all label org-dayflow-saved-queries))
+             (customize-save-variable 'org-dayflow-saved-queries
+                                      org-dayflow-saved-queries)
+             (message "Deleted saved query: %s" label)))
+          (_ (message "Unknown action")))))))
 
 (defun org-dayflow-filter-dispatch ()
-  "Interactively apply a filter to the dayflow view and exit after selection."
+  "Interactively filter the dayflow view (org-agenda-like `/').
+
+`s' opens query selection (presets include open/done/unit-at-point).
+`\\' clears back to `org-dayflow-initial-query'."
   (interactive)
   (catch 'dispatch-quit
     (cl-labels
@@ -1618,14 +2070,14 @@ Use `q' which is bound to `org-dayflow-quit' for full window-restore support."
            (let* ((face 'font-lock-keyword-face)
                   (prompt (concat
                            (format "Filter[%s]: " (if org-dayflow--filter-exclude "-" "+"))
-                           (propertize "[TAB]" 'face face) " manual " "("
-                           (propertize "[t]" 'face face) "ag " "to"
-                           (propertize "[d]" 'face face) "o "
-                           (propertize "[p]" 'face face) "roperty "
-                           (propertize "[c]" 'face face) "ategory "
-                           (propertize "[r]" 'face face) "egexp): "
+                           (propertize "[s]" 'face face) "elect presets "
+                           "("
+                           (propertize "[t]" 'face face) "ag "
+                           (propertize "[d]" 'face face) "odo "
+                           (propertize "[p]" 'face face) "rop "
+                           (propertize "[c]" 'face face) "at "
+                           (propertize "[r]" 'face face) "e) "
                            (propertize "[b]" 'face face) "uild "
-                           (propertize "[s]" 'face face) "elect "
                            (propertize "[\\]" 'face face) "off "
                            (propertize "[q]" 'face face) "uit"))
                   (char (read-char-exclusive prompt)))
@@ -1643,7 +2095,7 @@ Use `q' which is bound to `org-dayflow-quit' for full window-restore support."
                (?q  'quit)
                (?\t (intern (completing-read
                              "Select filter type: "
-                             '("tag" "todo" "property" "category" "regexp")
+                             '("select" "tag" "todo" "property" "category" "regexp")
                              nil t)))
                (_   (message "Invalid key: %s" (single-key-description char))
                     (read-filter))))))
@@ -1705,7 +2157,9 @@ Modeled after `org-agenda-prepare-window'."
       (pop-to-buffer buf '(org-display-buffer-split)))
      (t (pop-to-buffer buf)))
     (unless (equal (current-buffer) buf)
-      (pop-to-buffer-same-window buf))))
+      (pop-to-buffer-same-window buf))
+    (with-current-buffer buf
+      (org-dayflow--setup-sticky-windows))))
 
 (defun org-dayflow-quit ()
   "Exit the Dayflow buffer.
@@ -1715,6 +2169,7 @@ Respects `org-dayflow-restore-windows-after-quit' and the value of
   (let ((wconf org-dayflow-pre-window-conf)
         (buf (current-buffer)))
     (org-dayflow--unhighlight)
+    (org-dayflow--teardown-sticky-windows)
     (cond
      ((eq org-dayflow-window-setup 'other-frame)
       (delete-frame))
@@ -1769,7 +2224,15 @@ Respects `org-dayflow-restore-windows-after-quit' and the value of
   "Major mode for viewing Org tasks in a dayflow timeline."
   :keymap org-dayflow-mode-map
   (setq-local truncate-lines t)
-  (add-hook 'post-command-hook #'org-dayflow--update-cursor-highlight nil t))
+  (org-dayflow--update-header-line)
+  (add-hook 'post-command-hook #'org-dayflow--update-cursor-highlight nil t)
+  (add-hook 'post-command-hook #'org-dayflow--ensure-body-selected nil t)
+  (add-hook 'kill-buffer-hook #'org-dayflow--teardown-sticky-windows nil t)
+  (add-hook 'change-major-mode-hook #'org-dayflow--teardown-sticky-windows nil t))
+
+;; `window-scroll-functions' is not buffer-local; guard filters on
+;; window parameters set by `org-dayflow--setup-sticky-windows'.
+(add-hook 'window-scroll-functions #'org-dayflow--scroll-guard)
 
 (provide 'org-dayflow)
 
