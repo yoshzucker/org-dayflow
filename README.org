@@ -10,7 +10,8 @@ org-dayflow displays Org tasks on a compact horizontal timeline (day / week / mo
 ** Features
 
 - Multiple zoom levels (day, week, month, year) with sensible defaults and offsets
-- Vertical histogram showing task density per time unit (deadline / scheduled / active)
+- One-line load sparkline (Unicode block glyphs ▁▂▃▄▅▆▇█) showing task density per time unit; color encodes deadline / scheduled / active (and done)
+- Optional sticky header (experimental, off by default): dual-window freeze of query / units / sparkline
 - Rich interactive filtering (tag, todo, property, category, regexp) with include/exclude and "filter at point"
 - Saved queries + per-session history
 - Follow mode, direct editing (schedule/deadline/todo), and navigation that feels like =org-agenda=
@@ -51,12 +52,19 @@ In the Dayflow buffer the most important keys are:
 | =n= / =p= | next / previous item        | Move between tasks |
 | =RET= | =org-dayflow-switch-to=        | Jump to the Org heading |
 | =TAB= | =org-dayflow-goto=             | Open heading in other window |
-| =]=   | =org-dayflow-filter-dispatch=  | Powerful filter menu (t/d/p/c/r/...) |
+| =/=   | =org-dayflow-filter-dispatch=  | Filter menu (org-agenda-like); =s= selects presets |
+| =]=   | =org-dayflow-filter-dispatch=  | Same as =/= (legacy alias) |
 | =f=   | =org-dayflow-toggle-follow=    | Toggle follow mode |
 | =s= / =d= / =t= | schedule / deadline / todo | Edit the task at point |
 | =+= / =-= | zoom out / zoom in           | Change scale |
 | =<= / =>= | move timeline backward / forward | |
 | =. =  | =org-dayflow-offset-reset=     | Reset to default offset for current scale |
+
+Header-line shows the date under the cursor column (and the task's date when on a task row).
+Weekend columns on the day scale get a subtle background when =org-dayflow-column-bands= is non-nil.
+
+Query presets (via =/ s=): open+dated (default), all dated including done, open only, done only, unit at point, scheduled, deadline.
+Atoms include =(done)= and =(on-day MONTH DAY YEAR)=.
 
 ** Customization
 
@@ -67,6 +75,16 @@ In the Dayflow buffer the most important keys are:
 
 ;; Compact rendering
 (setq org-dayflow-high-density t)
+
+;; Sticky timeline header is experimental (dual-window); leave nil unless testing
+;; (setq org-dayflow-sticky-header t)
+
+;; Shade Sat/Sun columns on day scale (single face; set nil to disable)
+(setq org-dayflow-column-bands t)
+
+;; Default query is open+dated; include done via `/ s' -> "all dated (include done)"
+;; (setq org-dayflow-initial-query
+;;       '((or (scheduled) (deadline) (regexp org-ts-regexp))))
 
 ;; How many units to show and default starting point
 (setq org-dayflow-units-length 40
