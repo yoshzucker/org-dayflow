@@ -5,13 +5,25 @@
 
 Simple day-flowing timeline view for Org.
 
-org-dayflow displays Org tasks on a compact horizontal timeline (day / week / month / year scales) with a density histogram and aligned task titles. It is designed as a focused, visual complement to =org-agenda= rather than a replacement.
+org-dayflow displays Org tasks on a compact horizontal timeline with a density sparkline and aligned task titles. It is designed as a focused, visual complement to =org-agenda= rather than a replacement.
+
+What you pick is a *period* — a day, a week, a month, a quarter, a year, a decade — and the period decides what one column stands for and how many columns to aim for. =week= and =month= are both drawn a day to a column and differ only in length, which is the point: a week wants its days spread out, a month wants them packed.
+
+| Period | One column | At eighty columns |
+|--------+------------+-------------------|
+| =day= | an hour | about a day |
+| =week= | a day | ten days, eight columns each |
+| =month= | a day | twenty-six days |
+| =quarter= | a week | about four months |
+| =year= | a month | a year |
+| =decade= | a year | ten years |
+
+The grid fills the window, so a wider one shows more of the same period. Titles begin at their own column and run right, which is why a week is given wide columns and a month narrow ones: a week packed three columns to a day piles every title against the left edge.
 
 ** Features
 
-- Multiple zoom levels (day, week, month, year) with sensible defaults and offsets
+- Six periods from a day to a decade, each sized to the window
 - One-line load sparkline (Unicode block glyphs ▁▂▃▄▅▆▇█) showing task density per time unit; color encodes deadline / scheduled / active (and done)
-- Optional sticky header (experimental, off by default): dual-window freeze of query / units / sparkline
 - Rich interactive filtering (tag, todo, property, category, regexp) with include/exclude and "filter at point"
 - Saved queries + per-session history
 - Follow mode, direct editing (schedule/deadline/todo), and navigation that feels like =org-agenda=
@@ -56,12 +68,12 @@ In the Dayflow buffer the most important keys are:
 | =]=   | =org-dayflow-filter-dispatch=  | Same as =/= (legacy alias) |
 | =f=   | =org-dayflow-toggle-follow=    | Toggle follow mode |
 | =s= / =d= / =t= | schedule / deadline / todo | Edit the task at point |
-| =+= / =-= | zoom out / zoom in           | Change scale |
+| =+= / =-= | zoom out / zoom in           | Show the next longer / shorter period |
 | =<= / =>= | move timeline backward / forward | |
-| =. =  | =org-dayflow-offset-reset=     | Reset to default offset for current scale |
+| =. =  | =org-dayflow-offset-reset=     | Back to where the period starts |
 
 Header-line shows the date under the cursor column (and the task's date when on a task row).
-Weekend columns on the day scale get a subtle background when =org-dayflow-column-bands= is non-nil.
+Weekend columns get a subtle background, on the periods drawn a day to a column, when =org-dayflow-column-bands= is non-nil.
 
 Query presets (via =/ s=): open+dated (default), all dated including done, open only, done only, unit at point, scheduled, deadline.
 Atoms include =(done)= and =(on-day MONTH DAY YEAR)=.
@@ -76,19 +88,18 @@ Atoms include =(done)= and =(on-day MONTH DAY YEAR)=.
 ;; Compact rendering
 (setq org-dayflow-high-density t)
 
-;; Sticky timeline header is experimental (dual-window); leave nil unless testing
-;; (setq org-dayflow-sticky-header t)
-
-;; Shade Sat/Sun columns on day scale (single face; set nil to disable)
+;; Shade Sat/Sun columns where a column is a day (single face; nil to disable)
 (setq org-dayflow-column-bands t)
 
 ;; Default query is open+dated; include done via `/ s' -> "all dated (include done)"
 ;; (setq org-dayflow-initial-query
 ;;       '((or (scheduled) (deadline) (regexp org-ts-regexp))))
 
-;; How many units to show and default starting point
-(setq org-dayflow-units-length 40
-      org-dayflow-default-offsets '((day . -14) (week . -4) ...))
+;; What each period is made of, and how much of it is already behind you.
+;; The offsets are a share of the period rather than a count of columns,
+;; because the number of columns follows the window.
+(setq org-dayflow-spans '((day hour 24) (week day 10) (month day 26) ...)
+      org-dayflow-default-offsets '((week . -0.3) (month . -0.25) ...))
 #+end_src
 
 See =M-x customize-group RET org-dayflow RET= for the full list.
