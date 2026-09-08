@@ -37,56 +37,81 @@
 (require 'cl-lib)
 (require 'calendar)
 (require 'org)
+(require 'org-element)
+;; For `org-with-remote-undo' and the two variables it reads, which live in
+;; the agenda even though this is not one.
+(require 'org-agenda)
 
 (defgroup org-dayflow nil
   "Simple flowing timeline view for Org."
   :group 'org)
 
-(defcustom org-dayflow-unit-format "%02d "
-  "Format string used to display each unit (day/month/year) in the timeline."
-  :type 'string
+(defcustom org-dayflow-spans
+  '((day     hour   24)
+    (week    day    10)
+    (month   day    26)
+    (quarter week   14)
+    (year    month  12)
+    (decade  year   10))
+  "The periods a view can show, each as (PERIOD UNIT CELLS).
+
+What you pick is a period -- a day, a week, a month -- and the period says
+what one column is and how many of them to aim for.  `week' and `month' are
+both drawn a day to a column and differ only in length, which is the whole
+point: a week wants its days spread out, and a month wants them packed.
+
+CELLS is a target rather than a count.  The view fills the window, so a wide
+one shows more; what CELLS decides is how wide a column gets, and through
+that how much of the period is on the screen at eighty columns.
+
+Ordered from shortest to longest, because that is the order the zoom keys
+walk."
+  :type '(alist :key-type symbol :value-type (list symbol integer))
   :group 'org-dayflow)
 
-(defcustom org-dayflow-units-length 30
-  "Number of units (days/months/years) to show in the timeline."
+(defconst org-dayflow-unit-digits
+  '((hour . 2) (day . 2) (week . 2) (month . 2) (year . 4))
+  "How many digits a unit needs in its own column.
+
+A year is four and everything else is two.  Written down because a column
+was built from one format string for every unit, and `%02d' on 2026 is not
+two characters -- it is four, and the year row came out a column wider than
+the grid it was supposed to line up with.")
+
+(defcustom org-dayflow-min-cell-gap 1
+  "Blank columns kept to the right of a unit\='s digits.
+One is enough to read `06 07 08\=' as three numbers rather than one."
   :type 'integer
   :group 'org-dayflow)
 
-(defcustom org-dayflow-scales '(ten-min hour day week month year decade)
-  "List of available scales in order from most detailed to most general."
-  :type '(repeat (choice (const ten-min)
-                         (const hour)
-                         (const day)
-                         (const week)
-                         (const month)
-                         (const year)
-                         (const decade)))
+(defcustom org-dayflow-max-cell-width 10
+  "Widest a single column may become.
+
+A period with few units would otherwise spread them across the whole window,
+and a title starts at its own column: pushed far enough right, there is no
+room left to read it in."
+  :type 'integer
   :group 'org-dayflow)
 
-(defcustom org-dayflow-default-scale 'day
-  "Default scale for org-dayflow view."
-  :type `(choice ,@(mapcar (lambda (s)
-                             `(const :tag ,(capitalize (symbol-name s)) ,s))
-                           org-dayflow-scales))
+(defcustom org-dayflow-default-span 'month
+  "Period shown when none is asked for."
+  :type 'symbol
   :group 'org-dayflow)
 
 (defcustom org-dayflow-default-offsets
-  '((ten-min . -6)
-    (hour    . -2)
-    (day     . -7)
-    (week    . -3)
-    (month   . -1)
-    (year    . -10)
-    (decade  . -2))
-  "Default offsets from today for each scale in org-dayflow view."
-  :type '(alist :key-type (choice (const ten-min)
-                                  (const hour)
-                                  (const day)
-                                  (const week)
-                                  (const month)
-                                  (const year)
-                                  (const decade))
-                :value-type integer)
+  '((day     . -0.15)
+    (week    . -0.3)
+    (month   . -0.25)
+    (quarter . -0.25)
+    (year    . -0.2)
+    (decade  . -0.2))
+  "How much of each period is already behind you, as a share of it.
+
+A share rather than a count of columns: the number of columns follows the
+window, so a fixed count would put the past off the left edge of a wide
+window and swallow the whole view on a narrow one.  A little of it is worth
+keeping -- what happened yesterday is why today looks the way it does."
+  :type '(alist :key-type symbol :value-type number)
   :group 'org-dayflow)
 
 (defcustom org-dayflow-initial-query
@@ -112,17 +137,6 @@ Each entry is a cons cell of the form (LABEL . QUERY)."
   :type '(alist :key-type string :value-type sexp)
   :group 'org-dayflow
   :safe t)
-
-(defcustom org-dayflow-histogram-char-alist
-  '((deadline  . "#")
-    (active    . "*")
-    (scheduled . "+"))
-  "Legacy symbols for the old multi-row histogram (unused).
-Kept so existing user customizations do not error; the load graph is
-now drawn with `org-dayflow-spark-chars'."
-  :type '(alist :key-type (choice (const deadline) (const active) (const scheduled))
-                :value-type string)
-  :group 'org-dayflow)
 
 (defcustom org-dayflow-spark-chars "▁▂▃▄▅▆▇█"
   "Block glyphs (U+2581..U+2588) for the per-unit load sparkline.
@@ -158,17 +172,6 @@ a generic hook; populate it in your own configuration, not in the package."
   "If non-nil, render with less vertical padding:
 - no blank line after the query line
 - no blank line between the load sparkline and titles."
-  :type 'boolean
-  :group 'org-dayflow)
-
-(defcustom org-dayflow-sticky-header nil
-  "If non-nil, keep the timeline header (query, labels, units, sparkline)
-visible in a fixed upper window while task rows scroll below.
-
-Default is nil: the dual-window sticky approach is experimental and
-can leave a lone header window when the body window is deleted.
-Prefer filter / per-row date cues over sticky until a more robust
-design lands.  Set non-nil only for explicit sticky trials."
   :type 'boolean
   :group 'org-dayflow)
 
@@ -318,8 +321,8 @@ cursor currently sits on, and redrawn on every cursor movement."
   "Face for done-state (DONE/CANCEL/DELEG) task titles."
   :group 'org-dayflow)
 
-(defvar-local org-dayflow--current-scale nil
-  "Current scale in the org-dayflow buffer.")
+(defvar-local org-dayflow--current-span nil
+  "Period the org-dayflow buffer is showing.")
 
 (defvar-local org-dayflow--current-offset 0
   "Current offset from today for the dayflow timeline.")
@@ -345,15 +348,6 @@ cursor currently sits on, and redrawn on every cursor movement."
 (defvar-local org-dayflow--body-start nil
   "Buffer position of the first task row (start of the scrollable body).")
 
-(defvar-local org-dayflow--header-line-count 0
-  "Number of buffer lines in the sticky header region.")
-
-(defvar-local org-dayflow--header-window nil
-  "Window showing the sticky header, or nil.")
-
-(defvar-local org-dayflow--body-window nil
-  "Window showing the scrollable task body, or nil.")
-
 (defvar-local org-dayflow--cursor-column-overlays nil
   "List of overlays highlighting the cursor's cell column across grid rows.")
 
@@ -370,9 +364,9 @@ cursor currently sits on, and redrawn on every cursor movement."
     (define-key map (kbd "RET") #'org-dayflow-switch-to)
     (define-key map (kbd "TAB") #'org-dayflow-goto)
     (define-key map (kbd "r") #'org-dayflow-refresh)
-    (define-key map (kbd "-") #'org-dayflow-scale-zoom-out)
-    (define-key map (kbd "+") #'org-dayflow-scale-zoom-in)
-    (define-key map (kbd "Z") #'org-dayflow-scale)
+    (define-key map (kbd "-") #'org-dayflow-span-zoom-out)
+    (define-key map (kbd "+") #'org-dayflow-span-zoom-in)
+    (define-key map (kbd "Z") #'org-dayflow-span)
     (define-key map (kbd "n") #'org-dayflow-next-item)
     (define-key map (kbd "p") #'org-dayflow-previous-item)
     (define-key map (kbd "j") #'org-dayflow-next-item)
@@ -394,9 +388,50 @@ cursor currently sits on, and redrawn on every cursor movement."
   "Keymap for `org-dayflow-mode`.")
 
 ;;; Utility commands
-(defun org-dayflow--unit-char-width ()
-  "Return the width (in characters) of one unit based on `org-dayflow-unit-format`."
-  (length (format org-dayflow-unit-format 1)))
+(defun org-dayflow--span-unit (&optional span)
+  "Return the unit one column stands for in SPAN."
+  (or (car (alist-get (or span org-dayflow--current-span) org-dayflow-spans))
+      'day))
+
+(defun org-dayflow--span-cells (&optional span)
+  "Return the number of columns SPAN aims for."
+  (or (cadr (alist-get (or span org-dayflow--current-span) org-dayflow-spans))
+      26))
+
+(defun org-dayflow--view-width ()
+  "Return the columns available to the grid.
+
+The window when the buffer is in one, and the frame otherwise -- which is
+what a fresh buffer has before it is displayed, and what a batch test has
+instead of a window."
+  (let ((win (get-buffer-window (current-buffer) nil)))
+    (if (window-live-p win) (window-body-width win) (frame-width))))
+
+(defun org-dayflow--unit-char-width (&optional span width)
+  "Return the width in characters of one column of SPAN in WIDTH columns.
+
+The period asks for a number of columns and the window says how many
+characters there are, so the width of one is the division of the two --
+clamped below by what the unit\='s digits need and above by
+`org-dayflow-max-cell-width\='."
+  (let* ((span (or span org-dayflow--current-span))
+         (width (or width (org-dayflow--view-width)))
+         (unit (org-dayflow--span-unit span))
+         (floor-w (+ (alist-get unit org-dayflow-unit-digits 2)
+                     org-dayflow-min-cell-gap)))
+    (max floor-w
+         (min org-dayflow-max-cell-width
+              (/ width (max 1 (org-dayflow--span-cells span)))))))
+
+(defun org-dayflow--units-length (&optional span width)
+  "Return how many columns of SPAN fit in WIDTH."
+  (let ((width (or width (org-dayflow--view-width))))
+    (max 1 (/ width (org-dayflow--unit-char-width span width)))))
+
+(defun org-dayflow--unit-format (unit width)
+  "Return the format string for one UNIT column WIDTH characters wide."
+  (let ((digits (alist-get unit org-dayflow-unit-digits 2)))
+    (format "%%0%dd%s" digits (make-string (max 1 (- width digits)) ?\s))))
 
 (defun org-dayflow--label-safe-pos (pos positions)
   "Return the first position >= POS that does not overlap the last entry in POSITIONS.
@@ -426,10 +461,7 @@ POSITIONS is a list of (pos label-string) in reverse-push order."
   "Return the start date/datetime considering the current offset and scale."
   (let ((today (org-dayflow--datetime-now))
         (x org-dayflow--current-offset))
-    (pcase org-dayflow--current-scale
-      ('ten-min (let* ((now-min (org-dayflow--datetime-to-minutes (org-dayflow--datetime-now)))
-                       (aligned (* (/ now-min 10) 10)))
-                  (org-dayflow--minutes-to-datetime (+ aligned (* x 10)))))
+    (pcase (org-dayflow--span-unit)
       ('hour    (let* ((now-min (org-dayflow--datetime-to-minutes (org-dayflow--datetime-now)))
                        (aligned (* (/ now-min 60) 60)))
                   (org-dayflow--minutes-to-datetime (+ aligned (* x 60)))))
@@ -437,7 +469,6 @@ POSITIONS is a list of (pos label-string) in reverse-push order."
       ('week    (org-dayflow--date+ today (list 0 (* x 7) 0)))
       ('month   (org-dayflow--date+ today (list x 0 0)))
       ('year    (org-dayflow--date+ today (list 0 0 x)))
-      ('decade  (org-dayflow--date+ today (list 0 0 (* x 10))))
       (_        (org-dayflow--date+ today (list 0 x 0))))))
 
 (defun org-dayflow--day- (&rest dates)
@@ -500,81 +531,89 @@ POSITIONS is a list of (pos label-string) in reverse-push order."
              (lambda (a b) (not (org-dayflow--datetime< a b))))))
 
 ;;; Helper commands
-(defun org-dayflow--buffer-name (&optional scale)
+(defun org-dayflow--buffer-name (&optional span)
   "Return Org Dayflow buffer name."
-  (format "*Org Dayflow(%s)*" (symbol-name (or scale org-dayflow-default-scale))))
+  (format "*Org Dayflow(%s)*" (symbol-name (or span org-dayflow-default-span))))
 
-(defun org-dayflow--scale-set (scale)
-  "Set current scale and reset offset based on default."
-  (setq org-dayflow--current-scale scale)
-  (setq org-dayflow--current-offset (or (alist-get scale org-dayflow-default-offsets) 0)))
+(defun org-dayflow--span-set (span)
+  "Show SPAN, and put the view back at its default offset.
+
+The offset is kept as a count of columns, worked out here from the share
+the period asks for -- the period\='s own target rather than what the window
+happens to be, so opening a view lands in the same place whatever size the
+frame is."
+  (setq org-dayflow--current-span span)
+  (let ((share (or (alist-get span org-dayflow-default-offsets) 0)))
+    (setq org-dayflow--current-offset
+          (if (floatp share)
+              (round (* share (org-dayflow--span-cells span)))
+            share))))
 
 (defun org-dayflow--unit-face (now-p)
   "Return the face for a unit cell: now variant if NOW-P is non-nil."
   (if now-p 'org-dayflow-now-unit-face 'org-dayflow-units-face))
 
-(defun org-dayflow--day-scale-labels (start days)
-  "Generate a line of month name labels for DAY scale."
+(defun org-dayflow--day-scale-labels (start days width)
+  "Generate a line of month name labels for DAY units, WIDTH columns each."
   (let* ((start-abs (calendar-absolute-from-gregorian start))
-         (unit-char-width (org-dayflow--unit-char-width))
          (positions '()))
     (dotimes (d days)
       (cl-destructuring-bind (month day year)
           (calendar-gregorian-from-absolute (+ start-abs d))
         (let* ((label (format-time-string "%B" (encode-time 0 0 0 day month year))))
           (unless (equal label (cadr (car positions)))
-            (push (list (org-dayflow--label-safe-pos (* d unit-char-width) positions) label)
+            (push (list (org-dayflow--label-safe-pos (* d width) positions) label)
                   positions)))))
-    (org-dayflow--render-label-positions (nreverse positions) (* days unit-char-width))))
+    (org-dayflow--render-label-positions (nreverse positions) (* days width))))
 
-(defun org-dayflow--day-scale-units (start days)
-  "Generate a line of dates starting from START date for DAYS days."
+(defun org-dayflow--day-scale-units (start days width)
+  "Generate a line of dates from START for DAYS days, WIDTH columns each."
   (let ((start-abs (calendar-absolute-from-gregorian start))
         (today-abs (calendar-absolute-from-gregorian (org-dayflow--datetime-now)))
-        (day-width (org-dayflow--unit-char-width))
+        (fmt (org-dayflow--unit-format 'day width))
         (line ""))
-    (dotimes (d days (string-trim-right line))
+    (dotimes (d days)
       (let* ((date (calendar-gregorian-from-absolute (+ start-abs d)))
              (dow (calendar-day-of-week date)) ;; 0=Sunday, 6=Saturday
              (face (cond
                     ((= (+ start-abs d) today-abs) 'org-dayflow-now-unit-face)
                     ((or (= dow 0) (= dow 6)) 'org-dayflow-weekend-face)
                     (t 'org-dayflow-weekday-face)))
-             (text (propertize (format org-dayflow-unit-format (nth 1 date)) 'face face)))
-        (setq line (concat line text))))))
+             (text (propertize (format fmt (nth 1 date)) 'face face)))
+        (setq line (concat line text))))
+    (string-trim-right line)))
 
-(defun org-dayflow--week-scale-labels (start weeks)
-  "Generate a line of year labels for WEEK scale."
+(defun org-dayflow--week-scale-labels (start weeks width)
+  "Generate a line of year labels for WEEK units, WIDTH columns each."
   (let* ((start-abs (calendar-absolute-from-gregorian start))
-         (unit-char-width (org-dayflow--unit-char-width))
          (positions '()))
     (dotimes (w weeks)
-      (let* ((label (format "%d" (nth 2 (calendar-gregorian-from-absolute (+ start-abs (* w 7)))))))
+      (let* ((label (format "%d" (nth 2 (calendar-gregorian-from-absolute
+                                         (+ start-abs (* w 7)))))))
         (unless (equal label (cadr (car positions)))
-          (push (list (org-dayflow--label-safe-pos (* w unit-char-width) positions) label)
+          (push (list (org-dayflow--label-safe-pos (* w width) positions) label)
                 positions))))
-    (org-dayflow--render-label-positions (nreverse positions) (* weeks unit-char-width))))
+    (org-dayflow--render-label-positions (nreverse positions) (* weeks width))))
 
-(defun org-dayflow--week-scale-units (start weeks)
-  "Generate a line of ISO week numbers starting from START for WEEKS weeks."
+(defun org-dayflow--week-scale-units (start weeks width)
+  "Generate a line of ISO week numbers from START for WEEKS weeks."
   (let ((start-abs (calendar-absolute-from-gregorian start))
         (today-abs (calendar-absolute-from-gregorian (org-dayflow--datetime-now)))
+        (fmt (org-dayflow--unit-format 'week width))
         (line ""))
-    (dotimes (w weeks (string-trim-right line))
+    (dotimes (w weeks)
       (let* ((week-start-abs (+ start-abs (* w 7)))
-             (date (calendar-gregorian-from-absolute week-start-abs))
              (iso (calendar-iso-from-absolute week-start-abs))
              (iso-week (car iso))
              (face (org-dayflow--unit-face
                     (and (<= week-start-abs today-abs)
                          (< today-abs (+ week-start-abs 7))))))
-        (setq line (concat line (propertize (format "%02d " iso-week) 'face face)))))
-    line))
+        (setq line (concat line (propertize (format fmt iso-week) 'face face)))))
+    (string-trim-right line)))
 
-(defun org-dayflow--month-scale-labels (start months)
-  "Generate a line of year labels for MONTH scale."
-  (let* ((unit-char-width (org-dayflow--unit-char-width))
-         (year (nth 2 start))
+(defun org-dayflow--month-scale-labels (start months width)
+  "Generate a line of year labels for MONTH units, WIDTH columns each."
+  (let* ((year (nth 2 start))
          (month (nth 0 start))
          (positions '())
          (pos 0))
@@ -586,141 +625,99 @@ POSITIONS is a list of (pos label-string) in reverse-push order."
       (when (> month 12)
         (setq month 1)
         (setq year (1+ year)))
-      (setq pos (+ pos unit-char-width)))
-    (org-dayflow--render-label-positions (nreverse positions) (* months unit-char-width))))
+      (setq pos (+ pos width)))
+    (org-dayflow--render-label-positions (nreverse positions) (* months width))))
 
-(defun org-dayflow--month-scale-units (start months)
-  "Generate a line of month numbers for MONTH scale."
+(defun org-dayflow--month-scale-units (start months width)
+  "Generate a line of month numbers for MONTH units, WIDTH columns each."
   (cl-destructuring-bind (month _d1 year . _r1) start
     (cl-destructuring-bind (today-month _d2 today-year . _r2) (org-dayflow--datetime-now)
-      (let ((line ""))
+      (let ((fmt (org-dayflow--unit-format 'month width))
+            (line ""))
         (dotimes (_i months)
           (let* ((face (org-dayflow--unit-face
                         (and (= month today-month) (= year today-year)))))
-            (setq line (concat line
-                               (propertize (format org-dayflow-unit-format month)
-                                           'face face))))
+            (setq line (concat line (propertize (format fmt month) 'face face))))
           (setq month (1+ month))
           (when (> month 12)
             (setq month 1)
             (setq year (1+ year))))
         (string-trim-right line)))))
 
-(defun org-dayflow--year-scale-units (start years)
-  "Generate a line of year numbers for YEAR scale."
+(defun org-dayflow--year-scale-units (start years width)
+  "Generate a line of year numbers, WIDTH columns each.
+
+Four digits, because that is what a year is.  Formatted with the grid\='s
+own width rather than a shared format string: `%02d\=' pads to two and does
+not truncate, so a year drawn that way was a column wider than every other
+row on the page."
   (let ((start-year (nth 2 start))
         (today-year (nth 2 (org-dayflow--datetime-now)))
+        (fmt (org-dayflow--unit-format 'year width))
         (line ""))
     (dotimes (y years)
       (let ((year (+ start-year y))
             (face (org-dayflow--unit-face (= (+ start-year y) today-year))))
-        (setq line (concat line
-                           (propertize (format org-dayflow-unit-format year) 'face face)))))
+        (setq line (concat line (propertize (format fmt year) 'face face)))))
     (string-trim-right line)))
 
-(defun org-dayflow--decade-scale-labels (start decades)
-  "Generate a line of century labels for DECADE scale."
-  (let* ((unit-char-width (org-dayflow--unit-char-width))
-         (start-decade (* (/ (nth 2 start) 10) 10))
+(defun org-dayflow--year-scale-labels (start years width)
+  "Generate a line of decade labels for YEAR units, WIDTH columns each."
+  (let* ((start-year (nth 2 start))
          (positions '())
          (pos 0))
-    (dotimes (d decades)
-      (let* ((decade (+ start-decade (* d 10))))
-        (when (or (null positions) (= (% decade 100) 0))
+    (dotimes (y years)
+      (let ((year (+ start-year y)))
+        (when (or (null positions) (= (% year 10) 0))
           (push (list (org-dayflow--label-safe-pos pos positions)
-                      (format "%4d" (* (/ decade 100) 100)))
+                      (format "%4ds" (* (/ year 10) 10)))
                 positions))
-        (setq pos (+ pos unit-char-width))))
-    (org-dayflow--render-label-positions (nreverse positions) (* decades unit-char-width))))
+        (setq pos (+ pos width))))
+    (org-dayflow--render-label-positions (nreverse positions) (* years width))))
 
-(defun org-dayflow--decade-scale-units (start decades)
-  "Generate a line of decade labels for DECADE scale."
-  (let* ((start-decade (* (/ (nth 2 start) 10) 10))
-         (today-decade (* (/ (nth 2 (org-dayflow--datetime-now)) 10) 10))
-         (line ""))
-    (dotimes (d decades)
-      (let* ((decade (+ start-decade (* d 10)))
-             (face (org-dayflow--unit-face (= decade today-decade))))
-        (setq line (concat line
-                           (propertize (format org-dayflow-unit-format (% decade 100))
-                                       'face face)))))
-    (string-trim-right line)))
-
-(defun org-dayflow--hour-scale-labels (start hours)
-  "Generate date labels (e.g. \"Jun 7\") for HOUR scale."
+(defun org-dayflow--hour-scale-labels (start hours width)
+  "Generate date labels (e.g. \"Jun 7\") for HOUR units, WIDTH columns each."
   (let* ((start-abs-min (org-dayflow--datetime-to-minutes start))
-         (unit-char-width (org-dayflow--unit-char-width))
          (positions '()))
     (dotimes (h hours)
       (cl-destructuring-bind (month day year . _)
           (org-dayflow--minutes-to-datetime (+ start-abs-min (* h 60)))
         (let* ((label (format-time-string "%b %d" (encode-time 0 0 0 day month year))))
           (unless (equal label (cadr (car positions)))
-            (push (list (org-dayflow--label-safe-pos (* h unit-char-width) positions) label)
+            (push (list (org-dayflow--label-safe-pos (* h width) positions) label)
                   positions)))))
-    (org-dayflow--render-label-positions (nreverse positions) (* hours unit-char-width))))
+    (org-dayflow--render-label-positions (nreverse positions) (* hours width))))
 
-(defun org-dayflow--hour-scale-units (start hours)
-  "Generate hour number labels (00–23) for HOUR scale. START is (month day year hour minute)."
+(defun org-dayflow--hour-scale-units (start hours width)
+  "Generate hour numbers (00-23), WIDTH columns each.
+START is (month day year hour minute)."
   (let* ((start-abs-min  (org-dayflow--datetime-to-minutes start))
          (now-min        (org-dayflow--datetime-to-minutes (org-dayflow--datetime-now)))
          (now-hour-start (* (/ now-min 60) 60))
+         (fmt (org-dayflow--unit-format 'hour width))
          (line ""))
-    (dotimes (h hours (string-trim-right line))
+    (dotimes (h hours)
       (let* ((abs-min (+ start-abs-min (* h 60)))
              (dt      (org-dayflow--minutes-to-datetime abs-min))
              (face    (org-dayflow--unit-face (= abs-min now-hour-start))))
-        (setq line (concat line
-                           (propertize (format org-dayflow-unit-format (nth 3 dt))
-                                       'face face)))))
-    line))
+        (setq line (concat line (propertize (format fmt (nth 3 dt)) 'face face)))))
+    (string-trim-right line)))
 
-(defun org-dayflow--ten-min-scale-labels (start units)
-  "Generate hour labels for TEN-MIN scale.
-First label uses \"Jun 07 HH\" form; subsequent labels show only \"HH\"."
-  (let* ((start-abs-min (org-dayflow--datetime-to-minutes start))
-         (unit-char-width (org-dayflow--unit-char-width))
-         (positions '())
-         (prev-hour-str nil))
-    (dotimes (u units)
-      (cl-destructuring-bind (month day year hour minute)
-          (org-dayflow--minutes-to-datetime (+ start-abs-min (* u 10)))
-        (let* ((hour-str (format-time-string "%b %d %H" (encode-time 0 minute hour day month year))))
-          (unless (equal hour-str prev-hour-str)
-            (let* ((label (if positions
-                              (format-time-string "%H" (encode-time 0 minute hour day month year))
-                            hour-str)))
-              (push (list (org-dayflow--label-safe-pos (* u unit-char-width) positions) label)
-                    positions)
-              (setq prev-hour-str hour-str))))))
-    (org-dayflow--render-label-positions (nreverse positions) (* units unit-char-width))))
+(defun org-dayflow--scale-lines (span start units width)
+  "Generate the label and unit lines for SPAN, WIDTH columns to a unit.
 
-(defun org-dayflow--ten-min-scale-units (start units)
-  "Generate 10-minute labels (00,10,...,50) for TEN-MIN scale. START is (month day year hour minute)."
-  (let* ((start-abs-min   (org-dayflow--datetime-to-minutes start))
-         (now-min         (org-dayflow--datetime-to-minutes (org-dayflow--datetime-now)))
-         (now-ten-start   (* (/ now-min 10) 10))
-         (line ""))
-    (dotimes (u units (string-trim-right line))
-      (let* ((abs-min (+ start-abs-min (* u 10)))
-             (dt      (org-dayflow--minutes-to-datetime abs-min))
-             (face    (org-dayflow--unit-face (= abs-min now-ten-start))))
-        (setq line (concat line
-                           (propertize (format org-dayflow-unit-format (nth 4 dt))
-                                       'face face)))))
-    line))
-
-(defun org-dayflow--scale-lines (scale start units)
-  "Generate label and unit lines based on SCALE."
-  (let* ((label-fn (intern-soft (format "org-dayflow--%s-scale-labels" scale)))
-         (unit-fn  (intern-soft (format "org-dayflow--%s-scale-units" scale)))
+Named for the *unit*, not the period: `week' and `month' are drawn a day to
+a column and share every line of the drawing between them."
+  (let* ((unit     (org-dayflow--span-unit span))
+         (label-fn (intern-soft (format "org-dayflow--%s-scale-labels" unit)))
+         (unit-fn  (intern-soft (format "org-dayflow--%s-scale-units" unit)))
          (label    (when (fboundp label-fn)
-                     (funcall label-fn start units)))
-         (unit     (when (fboundp unit-fn)
-                     (funcall unit-fn start units))))
-    (if unit
-        (list label unit)
-      (error "No unit function found for scale: %s" scale))))
+                     (funcall label-fn start units width)))
+         (line     (when (fboundp unit-fn)
+                     (funcall unit-fn start units width))))
+    (if line
+        (list label line)
+      (error "No unit function found for unit: %s" unit))))
 
 (defun org-dayflow--element-start-datetime (el)
   "Return (month day year hour minute) for the start of timestamp element EL.
@@ -772,10 +769,7 @@ the first keyword-less active timestamp (body or heading)."
 
 (defun org-dayflow--title-unit (start task-date)
   "Return the position (unit offset) for TASK-DATE from START depending on current scale."
-  (pcase org-dayflow--current-scale
-    ('ten-min (/ (- (org-dayflow--datetime-to-minutes task-date)
-                    (org-dayflow--datetime-to-minutes start))
-                 10))
+  (pcase (org-dayflow--span-unit)
     ('hour    (/ (- (org-dayflow--datetime-to-minutes task-date)
                     (org-dayflow--datetime-to-minutes start))
                  60))
@@ -783,7 +777,6 @@ the first keyword-less active timestamp (body or heading)."
     ('week    (/ (org-dayflow--day- task-date start) 7))
     ('month   (org-dayflow--month- task-date start))
     ('year    (- (nth 2 task-date) (nth 2 start)))
-    ('decade  (- (/ (nth 2 task-date) 10) (/ (nth 2 start) 10)))
     (_        (org-dayflow--day- task-date start))))
 
 (defun org-dayflow--get-heading-face ()
@@ -831,7 +824,7 @@ the first keyword-less active timestamp (body or heading)."
       (display-buffer (marker-buffer marker))
       (with-selected-window (get-buffer-window (marker-buffer marker))
         (goto-char marker)
-        (org-show-entry)))))
+        (org-fold-show-entry)))))
 
 (defun org-dayflow--build-query (base-query &optional append-query)
   "Combine BASE-QUERY with APPEND-QUERY into a well-formed query.
@@ -942,7 +935,7 @@ Matches SCHEDULED, DEADLINE, or the first active TIMESTAMP day."
 (defun org-dayflow--unit-index-to-datetime (unit)
   "Return (month day year hour minute) for UNIT index in the current view."
   (let ((start (org-dayflow--date-start)))
-    (pcase org-dayflow--current-scale
+    (pcase (org-dayflow--span-unit)
       ('day
        (let* ((start-abs (calendar-absolute-from-gregorian start))
               (g (calendar-gregorian-from-absolute (+ start-abs unit))))
@@ -961,8 +954,6 @@ Matches SCHEDULED, DEADLINE, or the first active TIMESTAMP day."
        (org-dayflow--date+ start (list unit 0 0)))
       ('year
        (org-dayflow--date+ start (list 0 0 unit)))
-      ('decade
-       (org-dayflow--date+ start (list 0 0 (* unit 10))))
       (_
        (let* ((start-abs (calendar-absolute-from-gregorian start))
               (g (calendar-gregorian-from-absolute (+ start-abs unit))))
@@ -1029,7 +1020,11 @@ QUERY may also be the symbol `unit-at-point', resolved at apply time."
 LABEL is a string shown in prompt.
 CANDIDATES is a list of strings for completion.
 BUILDER is a function that takes a string and returns a query S-expression.
-ACTIONS is an alist of extra keybindings like ((?. . fn))."
+ACTIONS is an alist of extra keys, each a function that *returns* a query --
+or a list of them -- and nil when it has nothing to give.  Returned rather
+than assigned: an action written in another function cannot reach the local
+this one is collecting into, and the one that tried set a global of the same
+name instead and filtered nothing at all."
   (let (new-query)
     (catch 'quit
       (cl-flet ((filter-from (reader)
@@ -1059,7 +1054,7 @@ ACTIONS is an alist of extra keybindings like ((?. . fn))."
                   (filter-from reader)
                   (throw 'quit nil)))
                ((assoc char actions)
-                (funcall (cdr (assoc char actions)))
+                (setq new-query (funcall (cdr (assoc char actions))))
                 (when new-query (throw 'quit nil)))
                (t (message "Invalid key: %s" (single-key-description char)))))))))
     (when new-query
@@ -1370,7 +1365,7 @@ No-op when UNIT is outside [0, UNITS)."
 Uses a single face (`org-dayflow-weekend-column-face') so the cue stays
 simple: denser shade = Saturday/Sunday."
   (when (and org-dayflow-column-bands
-             (eq org-dayflow--current-scale 'day))
+             (eq (org-dayflow--span-unit) 'day))
     (let ((start-abs (calendar-absolute-from-gregorian view-start)))
       (dotimes (unit units)
         (let* ((date (calendar-gregorian-from-absolute (+ start-abs unit)))
@@ -1399,7 +1394,7 @@ keeps priority in the merged `face' text property."
   "Return the unit cell index the cursor currently sits on, or nil if outside."
   (let* ((width (org-dayflow--unit-char-width))
          (cell (/ (current-column) width)))
-    (when (and (<= 0 cell) (< cell org-dayflow-units-length))
+    (when (and (<= 0 cell) (< cell (org-dayflow--units-length)))
       cell)))
 
 (defun org-dayflow--pos-at-column (col)
@@ -1470,7 +1465,7 @@ overlays without ever modifying the read-only buffer."
                          (format "col %s" (org-dayflow--format-datetime-short unit-dt)))
                        (when task-dt
                          (format "task %s" (org-dayflow--format-datetime-short task-dt)))
-                       (format "scale %s" org-dayflow--current-scale)))))
+                       (format "%s" org-dayflow--current-span)))))
     (mapconcat #'identity parts "  |  ")))
 
 (defun org-dayflow--update-header-line ()
@@ -1522,13 +1517,14 @@ characters."
 (defun org-dayflow--render ()
   "Render the timeline contents in the current buffer."
   (let* ((start (org-dayflow--date-start))
-         (units org-dayflow-units-length)
          (unit-char-width (org-dayflow--unit-char-width))
-         (label-lines (org-dayflow--scale-lines org-dayflow--current-scale start units))
+         (units (org-dayflow--units-length))
+         (label-lines (org-dayflow--scale-lines org-dayflow--current-span start units
+                                                unit-char-width))
          (tasks (org-dayflow--select-entries
                  (org-dayflow--build-query org-dayflow--current-query))))
     (let ((inhibit-read-only t))
-      (rename-buffer (org-dayflow--buffer-name org-dayflow--current-scale) t)
+      (rename-buffer (org-dayflow--buffer-name org-dayflow--current-span) t)
       (erase-buffer)
       (insert (propertize
                (format "query: %s"
@@ -1564,181 +1560,47 @@ characters."
         (org-dayflow--draw-now-column grid-start start units unit-char-width)
         (setq org-dayflow--unit-line-start unit-line-start)
         (setq org-dayflow--grid-start grid-start)
-        (setq org-dayflow--body-start body-start)
-        (setq org-dayflow--header-line-count
-              (max 0 (count-lines (point-min) body-start))))
+        (setq org-dayflow--body-start body-start))
       (goto-char (or org-dayflow--body-start (point-min)))
       (org-dayflow--update-header-line))))
-
-;;; Sticky header (fixed upper window + scrollable body)
-
-(defvar org-dayflow--in-scroll-guard nil
-  "Non-nil while `org-dayflow--scroll-guard' is adjusting window-start.")
-
-(defun org-dayflow--scroll-guard (window _new-start)
-  "Keep sticky header frozen and body start clamped on WINDOW."
-  (unless org-dayflow--in-scroll-guard
-    (when (window-live-p window)
-      (let ((org-dayflow--in-scroll-guard t)
-            (role (window-parameter window 'org-dayflow-role)))
-        (cond
-         ((eq role 'header)
-          (set-window-start window (point-min) t)
-          (set-window-vscroll window 0))
-         ((eq role 'body)
-          (with-current-buffer (window-buffer window)
-            (when (and org-dayflow--body-start
-                       (< (window-start window) org-dayflow--body-start))
-              (set-window-start window org-dayflow--body-start t)))))))))
-
-(defun org-dayflow--ensure-body-selected ()
-  "When sticky dual-window is active, keep point out of the header window.
-
-With sticky disabled (the default), do not clamp point: clamping to
-`org-dayflow--body-start' prevented scrolling back up to the unit row
-with `k' / previous-item after `j' had pushed the header off-screen."
-  (when (and org-dayflow-sticky-header
-             (window-live-p org-dayflow--header-window)
-             (window-live-p org-dayflow--body-window))
-    (when (eq (selected-window) org-dayflow--header-window)
-      (select-window org-dayflow--body-window))
-    (when (and org-dayflow--body-start
-               (derived-mode-p 'org-dayflow-mode)
-               (< (point) org-dayflow--body-start))
-      (goto-char org-dayflow--body-start))))
-
-(defun org-dayflow--first-item-position ()
-  "Buffer position of the first task line, or nil."
-  (when org-dayflow--body-start
-    (save-excursion
-      (goto-char org-dayflow--body-start)
-      (while (and (not (eobp))
-                  (not (get-text-property (point) 'org-marker)))
-        (forward-line 1))
-      (and (get-text-property (point) 'org-marker) (point)))))
-
-(defun org-dayflow--at-first-item-p ()
-  "Return non-nil if point is on the first task row."
-  (let ((first (org-dayflow--first-item-position)))
-    (and first
-         (get-text-property (point) 'org-marker)
-         (= (line-beginning-position)
-            (save-excursion (goto-char first) (line-beginning-position))))))
-
-(defun org-dayflow--timeline-header-obscured-p ()
-  "Non-nil when the window start is below the buffer top (header scrolled away)."
-  (> (window-start) (point-min)))
-
-(defun org-dayflow--reveal-timeline-header ()
-  "Scroll so query / units / sparkline are visible; keep point on a task.
-
-Used when previous-item has nowhere left to go, or lands on the first
-task while the header is off-screen."
-  (let ((win (selected-window))
-        (task (or (and (get-text-property (point) 'org-marker) (point))
-                  (org-dayflow--first-item-position))))
-    (set-window-start win (point-min) t)
-    (when task
-      (goto-char task)
-      (org-dayflow--move-to-title))))
-
-(defun org-dayflow--teardown-sticky-windows ()
-  "Remove the sticky header split; leave one window on this buffer."
-  (let ((header org-dayflow--header-window)
-        (body org-dayflow--body-window)
-        (buf (current-buffer)))
-    (setq org-dayflow--header-window nil
-          org-dayflow--body-window nil)
-    (when (and (window-live-p header) (window-live-p body))
-      (when (eq (selected-window) header)
-        (select-window body))
-      (delete-window header))
-    (dolist (w (get-buffer-window-list buf nil t))
-      (set-window-parameter w 'org-dayflow-role nil)
-      (set-window-parameter w 'no-other-window nil))))
-
-(defun org-dayflow--setup-sticky-windows ()
-  "Split a fixed header window above the scrollable task body.
-
-No-op when `org-dayflow-sticky-header' is nil or the buffer has no
-body region.  Safe to call repeatedly (tears down any previous split)."
-  (org-dayflow--teardown-sticky-windows)
-  (when (and org-dayflow-sticky-header
-             (derived-mode-p 'org-dayflow-mode)
-             org-dayflow--body-start
-             (> org-dayflow--header-line-count 0))
-    (let* ((buf (current-buffer))
-           (body-win (or (get-buffer-window buf) (selected-window)))
-           (header-lines org-dayflow--header-line-count)
-           header-win)
-      (when (and (window-live-p body-win)
-                 (eq (window-buffer body-win) buf)
-                 ;; Need room for header + at least one body line.
-                 (> (window-total-height body-win) (1+ header-lines)))
-        (select-window body-win)
-        ;; Negative SIZE = height of the new window (Emacs split-window API).
-        (setq header-win (split-window body-win (- header-lines) 'above))
-        (set-window-buffer header-win buf)
-        (set-window-buffer body-win buf)
-        (set-window-parameter header-win 'org-dayflow-role 'header)
-        (set-window-parameter body-win 'org-dayflow-role 'body)
-        ;; Skip header when cycling other-window.
-        (set-window-parameter header-win 'no-other-window t)
-        (set-window-start header-win (point-min) t)
-        (set-window-point header-win (point-min))
-        (set-window-vscroll header-win 0)
-        (set-window-start body-win org-dayflow--body-start t)
-        (set-window-point body-win
-                          (max org-dayflow--body-start
-                               (min (point-max) (window-point body-win))))
-        ;; Lock header height after split (split-window uses line count
-        ;; in body-lines units; re-fit in case of mode-line differences).
-        (let ((delta (- header-lines (window-body-height header-win))))
-          (when (and (/= delta 0)
-                     (> (+ (window-total-height header-win) delta) 1))
-            (window-resize header-win delta nil nil t)))
-        (setq org-dayflow--header-window header-win
-              org-dayflow--body-window body-win)
-        (select-window body-win)
-        (when (< (point) org-dayflow--body-start)
-          (goto-char org-dayflow--body-start))))))
 
 ;;; User commands
 (defun org-dayflow-refresh ()
   "Refresh the current org-dayflow buffer."
   (interactive)
   (when (derived-mode-p 'org-dayflow-mode)
-    (org-dayflow--render)
-    (org-dayflow--setup-sticky-windows)))
+    (org-dayflow--render)))
 
-(defun org-dayflow-scale-zoom-out ()
-  "Increase org-dayflow scale (zoom out) by moving to the next broader unit."
+(defun org-dayflow--span-names ()
+  "The periods, shortest first."
+  (mapcar #'car org-dayflow-spans))
+
+(defun org-dayflow-span-zoom-out ()
+  "Show the next longer period."
   (interactive)
-  (let* ((scales org-dayflow-scales)
-         (current org-dayflow--current-scale)
-         (pos (cl-position current scales)))
-    (when (and pos (< (1+ pos) (length scales)))
-      (org-dayflow--scale-set (nth (1+ pos) scales))
+  (let* ((spans (org-dayflow--span-names))
+         (pos (cl-position org-dayflow--current-span spans)))
+    (when (and pos (< (1+ pos) (length spans)))
+      (org-dayflow--span-set (nth (1+ pos) spans))
       (org-dayflow-refresh))))
 
-(defun org-dayflow-scale-zoom-in ()
-  "Decrease org-dayflow scale (zoom in) by moving to the next finer unit."
+(defun org-dayflow-span-zoom-in ()
+  "Show the next shorter period."
   (interactive)
-  (let* ((scales org-dayflow-scales)
-         (current org-dayflow--current-scale)
-         (pos (cl-position current scales)))
+  (let* ((spans (org-dayflow--span-names))
+         (pos (cl-position org-dayflow--current-span spans)))
     (when (and pos (> pos 0))
-      (org-dayflow--scale-set (nth (1- pos) scales))
+      (org-dayflow--span-set (nth (1- pos) spans))
       (org-dayflow-refresh))))
 
-(defun org-dayflow-scale (scale)
-  "Switch to SCALE, selected via minibuffer completion."
+(defun org-dayflow-span (span)
+  "Switch to SPAN, selected via minibuffer completion."
   (interactive
    (list (intern (completing-read
-                  (format "Scale (current: %s): " org-dayflow--current-scale)
-                  (mapcar #'symbol-name org-dayflow-scales)
+                  (format "Period (current: %s): " org-dayflow--current-span)
+                  (mapcar #'symbol-name (org-dayflow--span-names))
                   nil t))))
-  (org-dayflow--scale-set scale)
+  (org-dayflow--span-set span)
   (org-dayflow-refresh))
 
 (defun org-dayflow-next-item (n)
@@ -1759,10 +1621,7 @@ body region.  Safe to call repeatedly (tears down any previous split)."
 (defun org-dayflow-previous-item (n)
   "Move to the previous N-th item in the org-dayflow buffer.
 
-If there is no previous task, or the first task is already selected
-while the unit header is scrolled out of view, scroll so the
-timeline header (query / units / sparkline) becomes visible again
-without leaving point stranded above the task rows."
+At the first task, says so rather than moving anywhere."
   (interactive "p")
   (let ((moved nil))
     (dotimes (_ n)
@@ -1777,16 +1636,12 @@ without leaving point stranded above the task rows."
     (cond
      (moved
       (org-dayflow--move-to-title)
-      (when (and (org-dayflow--at-first-item-p)
-                 (org-dayflow--timeline-header-obscured-p))
-        (org-dayflow--reveal-timeline-header))
       (org-dayflow-echo-info)
       (when org-dayflow--follow-mode
         (let ((marker (get-text-property (point) 'org-marker)))
           (org-dayflow--follow)
           (org-dayflow--highlight-current-heading marker))))
      (t
-      (org-dayflow--reveal-timeline-header)
       (org-dayflow-echo-info)
       (message "Beginning of dayflow")))))
 
@@ -1813,10 +1668,9 @@ without leaving point stranded above the task rows."
   (org-dayflow-refresh))
 
 (defun org-dayflow-offset-reset ()
-  "Reset the timeline view to the default offset for the current scale."
+  "Reset the timeline view to the default offset for the current period."
   (interactive)
-  (setq org-dayflow--current-offset
-        (alist-get org-dayflow--current-scale org-dayflow-default-offsets 0))
+  (org-dayflow--span-set org-dayflow--current-span)
   (org-dayflow-refresh))
 
 (defun org-dayflow-switch-to ()
@@ -1827,7 +1681,7 @@ without leaving point stranded above the task rows."
         (progn
           (switch-to-buffer (marker-buffer marker))
           (goto-char marker)
-          (org-show-entry))
+          (org-fold-show-entry))
       (message "No task at point."))))
 
 (defun org-dayflow-goto ()
@@ -1838,7 +1692,7 @@ without leaving point stranded above the task rows."
         (progn
           (pop-to-buffer (marker-buffer marker))
           (goto-char marker)
-          (org-show-entry))
+          (org-fold-show-entry))
       (message "No task at point."))))
 
 (defun org-dayflow-bury-buffer ()
@@ -1931,19 +1785,19 @@ Also prefixes the timeline column date under point when available."
    immediate
    `((?. . ,(lambda ()
               (let ((marker (get-text-property (point) 'org-marker)))
-                (if (and marker (marker-buffer marker))
-                    (with-current-buffer (marker-buffer marker)
-                      (goto-char marker)
-                      (let ((tags (org-get-tags)))
-                        (if (null tags)
-                            (message "No tags found at point.")
-                          (setq new-query
-                                (mapcar (lambda (tag)
-                                          (if org-dayflow--filter-exclude
-                                              `(not (tags ,tag))
-                                            `(tags ,tag)))
-                                        tags)))))
-                  (message "No task at point."))))))))
+                (cond
+                 ((not (and marker (marker-buffer marker)))
+                  (message "No task at point.")
+                  nil)
+                 (t
+                  (let ((tags (org-with-point-at marker (org-get-tags))))
+                    (if (null tags)
+                        (progn (message "No tags found at point.") nil)
+                      (mapcar (lambda (tag)
+                                (if org-dayflow--filter-exclude
+                                    `(not (tags ,tag))
+                                  `(tags ,tag)))
+                              tags)))))))))))
 
 (defun org-dayflow-filter-by-todo (&optional immediate)
   "Filter org-dayflow by TODO keywords. If IMMEDIATE is non-nil, enter completing-read immediately."
@@ -2098,7 +1952,11 @@ entries still offer apply / save / delete."
                              '("select" "tag" "todo" "property" "category" "regexp")
                              nil t)))
                (_   (message "Invalid key: %s" (single-key-description char))
-                    (read-filter))))))
+                    (read-filter)))))
+         ;; Every branch above returns a symbol this handles, so nothing
+         ;; reaches here -- but `char' belongs to `read-filter' and naming it
+         ;; out here was a void variable waiting for the day one did.
+         (unknown (sym) (message "Invalid filter: %s" sym)))
       (while t
         (pcase (read-filter)
           ('include  (setq org-dayflow--filter-exclude nil))
@@ -2113,14 +1971,17 @@ entries still offer apply / save / delete."
                      (throw 'dispatch-quit nil))
           ('regexp   (org-dayflow-filter-by-regexp t)
                      (throw 'dispatch-quit nil))
-          ('build    (org-dayflow-filter)
+          ;; `call-interactively', because the command reads its query from
+          ;; the minibuffer.  Called as a function it was one argument short
+          ;; and `b' answered with `wrong-number-of-arguments'.
+          ('build    (call-interactively #'org-dayflow-filter)
                      (throw 'dispatch-quit nil))
           ('select   (org-dayflow-select-query)
                      (throw 'dispatch-quit nil))
           ('remove   (org-dayflow-remove-filter)
                      (throw 'dispatch-quit nil))
           ('quit     (throw 'dispatch-quit nil))
-          (_         (message "Invalid key: %s" (single-key-description char))))))))
+          (other     (unknown other)))))))
 
 (defun org-dayflow-schedule ()
   (interactive)
@@ -2158,8 +2019,7 @@ Modeled after `org-agenda-prepare-window'."
      (t (pop-to-buffer buf)))
     (unless (equal (current-buffer) buf)
       (pop-to-buffer-same-window buf))
-    (with-current-buffer buf
-      (org-dayflow--setup-sticky-windows))))
+    buf))
 
 (defun org-dayflow-quit ()
   "Exit the Dayflow buffer.
@@ -2169,7 +2029,6 @@ Respects `org-dayflow-restore-windows-after-quit' and the value of
   (let ((wconf org-dayflow-pre-window-conf)
         (buf (current-buffer)))
     (org-dayflow--unhighlight)
-    (org-dayflow--teardown-sticky-windows)
     (cond
      ((eq org-dayflow-window-setup 'other-frame)
       (delete-frame))
@@ -2186,11 +2045,11 @@ Respects `org-dayflow-restore-windows-after-quit' and the value of
     (bury-buffer buf)))
 
 ;;;###autoload
-(defun org-dayflow-display (&optional scale)
-  "Display Org Dayflow buffer for SCALE or default."
+(defun org-dayflow-display (&optional span)
+  "Display the Org Dayflow buffer for SPAN, or for the default period."
   (interactive)
-  (let* ((scale (or scale org-dayflow-default-scale))
-         (bufname (org-dayflow--buffer-name scale))
+  (let* ((span (or span org-dayflow-default-span))
+         (bufname (org-dayflow--buffer-name span))
          (buf (get-buffer bufname))
          (wconf (unless (get-buffer-window buf)
                   (current-window-configuration))))
@@ -2198,7 +2057,7 @@ Respects `org-dayflow-restore-windows-after-quit' and the value of
       (setq buf (get-buffer-create bufname))
       (with-current-buffer buf
         (org-dayflow-mode)
-        (org-dayflow--scale-set scale)
+        (org-dayflow--span-set span)
         (org-dayflow--render)))
     (when wconf
       (setq org-dayflow-pre-window-conf wconf))
@@ -2206,16 +2065,16 @@ Respects `org-dayflow-restore-windows-after-quit' and the value of
 
 ;;;###autoload
 (defun org-dayflow ()
-  "Prompt for a view scale and display org-dayflow timeline accordingly."
+  "Prompt for a period and show the timeline over it."
   (interactive)
-  (let ((key (read-key "org-dayflow: [f]default [t]en-min [h]our [d]ay [w]eek [m]onth [y]ear [D]ecade")))
+  (let ((key (read-key (concat "org-dayflow: [f]default "
+                               "[d]ay [w]eek [m]onth [q]uarter [y]ear [D]ecade"))))
     (pcase key
       ((or ?f ?\r ?\n) (org-dayflow-display))
-      (?t (org-dayflow-display 'ten-min))
-      (?h (org-dayflow-display 'hour))
       (?d (org-dayflow-display 'day))
       (?w (org-dayflow-display 'week))
       (?m (org-dayflow-display 'month))
+      (?q (org-dayflow-display 'quarter))
       (?y (org-dayflow-display 'year))
       (?D (org-dayflow-display 'decade))
       (_ (message "Unknown key: %c" key)))))
@@ -2225,14 +2084,7 @@ Respects `org-dayflow-restore-windows-after-quit' and the value of
   :keymap org-dayflow-mode-map
   (setq-local truncate-lines t)
   (org-dayflow--update-header-line)
-  (add-hook 'post-command-hook #'org-dayflow--update-cursor-highlight nil t)
-  (add-hook 'post-command-hook #'org-dayflow--ensure-body-selected nil t)
-  (add-hook 'kill-buffer-hook #'org-dayflow--teardown-sticky-windows nil t)
-  (add-hook 'change-major-mode-hook #'org-dayflow--teardown-sticky-windows nil t))
-
-;; `window-scroll-functions' is not buffer-local; guard filters on
-;; window parameters set by `org-dayflow--setup-sticky-windows'.
-(add-hook 'window-scroll-functions #'org-dayflow--scroll-guard)
+  (add-hook 'post-command-hook #'org-dayflow--update-cursor-highlight nil t))
 
 (provide 'org-dayflow)
 
