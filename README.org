@@ -9,6 +9,8 @@ org-dayflow displays Org tasks on a compact horizontal timeline with a density s
 
 What you pick is a *period* — a day, a week, a month, a quarter, a year, a decade — and the period decides what one column stands for and how many columns to aim for. =week= and =month= are both drawn a day to a column and differ only in length, which is the point: a week wants its days spread out, a month wants them packed.
 
+The default is =week=: far enough to see what is coming, near enough that the days are still days rather than columns.
+
 | Period | One column | At eighty columns |
 |--------+------------+-------------------|
 | =day= | an hour | about a day |
@@ -22,7 +24,8 @@ The grid fills the window, so a wider one shows more of the same period. Titles 
 
 ** Features
 
-- Six periods from a day to a decade, each sized to the window
+- Six periods from a day to a decade, each sized to the window; a week and a bit is the default
+- A demo mode (=M-x org-dayflow-demo-mode=) that generates a few weeks of work, dated from today, so the view can be looked at before anything is configured
 - One-line load sparkline (Unicode block glyphs ▁▂▃▄▅▆▇█) showing task density per time unit; color encodes deadline / scheduled / active (and done)
 - Rich interactive filtering (tag, todo, property, category, regexp) with include/exclude and "filter at point"
 - Saved queries + per-session history
@@ -103,6 +106,22 @@ Atoms include =(done)= and =(on-day MONTH DAY YEAR)=.
 #+end_src
 
 See =M-x customize-group RET org-dayflow RET= for the full list.
+
+** Looking at it before configuring anything
+
+: M-x org-dayflow-demo-mode
+
+Generates a few weeks of work in a directory of its own, points
+=org-agenda-files= at it, declares the keywords and category colours the
+generated files are written in, and opens the view. Switching it off puts the
+files back and kills the Dayflow buffers — the buffer is named for its period
+and not for where its rows came from, so a demo left on the screen is a week
+nobody could tell from their own.
+
+The dates are computed from today rather than written down, and one piece of
+work sits past the edge of each period, so stepping out to a longer one always
+reveals something. =M-x org-dayflow-demo-regenerate= is the way back after
+moving things about in the view.
 
 ** Comparison with Similar Tools
 

@@ -158,6 +158,98 @@ and the filter it built went nowhere."
        (list (cons ?. (lambda () nil)))))
     (should-not org-dayflow--current-query)))
 
+(ert-deftest org-dayflow-test-the-default-is-a-week ()
+  "A week and a bit is the horizon a day is planned against: far enough to
+see what is coming, near enough that the days are still days."
+  (should (eq 'week org-dayflow-default-span))
+  (should (string-match-p "week" (org-dayflow--buffer-name))))
+
+;;;; The demo
+
+(require 'org-dayflow-demo)
+
+(defmacro org-dayflow-test--with-demo (&rest body)
+  "Run BODY with the demo written to a directory of its own."
+  (declare (indent 0))
+  `(let* ((dir (file-name-as-directory (make-temp-file "dfdemo" t)))
+          (org-dayflow-demo-directory dir))
+     (unwind-protect (progn ,@body)
+       (dolist (b (buffer-list))
+         (when (and (buffer-file-name b)
+                    (string-prefix-p dir (buffer-file-name b)))
+           (with-current-buffer b (set-buffer-modified-p nil))
+           (kill-buffer b)))
+       (delete-directory dir t))))
+
+(ert-deftest org-dayflow-test-the-demo-is-dated-from-today ()
+  "A fixture with dates written into it is right on the day it was written
+and misleading forever after.  A timeline is a picture of where today sits
+among what is coming, and it cannot be drawn from a file that thinks today
+was last spring."
+  (org-dayflow-test--with-demo
+    (org-dayflow-demo-regenerate)
+    (let ((text (with-temp-buffer
+                  (insert-file-contents
+                   (expand-file-name "work.org" org-dayflow-demo-directory))
+                  (buffer-string))))
+      (should (string-match-p (regexp-quote (format-time-string "%Y-%m-%d"))
+                              text))
+      ;; and the whole of it moves: something behind today, something ahead
+      (should (string-match-p
+               (regexp-quote (format-time-string
+                              "%Y-%m-%d" (time-add nil (days-to-time -4))))
+               text))
+      (should (string-match-p
+               (regexp-quote (format-time-string
+                              "%Y-%m-%d" (time-add nil (days-to-time 5))))
+               text)))))
+
+(defun org-dayflow-test--rows (span)
+  "Return how many task rows SPAN draws from the current agenda files."
+  (with-temp-buffer
+    (org-dayflow-mode)
+    (org-dayflow--span-set span)
+    (setq org-dayflow--current-query nil)
+    (org-dayflow--render)
+    (cl-count-if (lambda (l) (string-match-p "^ *\\*[^ ]" l))
+                 (split-string (buffer-string) "\n"))))
+
+(ert-deftest org-dayflow-test-a-longer-period-shows-more ()
+  "The demo reaches past the week it opens on.
+
+A longer view that shows the same rows as a shorter one demonstrates
+nothing: what a month is *for* is the work that is not in this week, so the
+generated data has to have some."
+  (org-dayflow-test--with-demo
+    (let ((org-agenda-files (org-dayflow-demo-regenerate))
+          (org-todo-keywords '((sequence "NEXT" "ONGO" "|" "DONE" "CANCEL")
+                               (sequence "WAIT" "|" "DELEG"))))
+      (let ((week (org-dayflow-test--rows 'week))
+            (month (org-dayflow-test--rows 'month))
+            (quarter (org-dayflow-test--rows 'quarter))
+            (year (org-dayflow-test--rows 'year)))
+        (should (> week 0))
+        (should (> month week))
+        (should (> quarter month))
+        (should (> year quarter))))))
+
+(ert-deftest org-dayflow-test-the-demo-puts-everything-back ()
+  "The buffer is named for its period and not for where its rows came from,
+so a demo left on the screen is a week nobody could tell from their own."
+  (org-dayflow-test--with-demo
+    (let ((org-agenda-files '("/nowhere/real.org"))
+          (org-todo-keywords org-todo-keywords)
+          (org-dayflow-category-faces '(("mine" . default))))
+      (cl-letf (((symbol-function 'org-dayflow-display) #'ignore))
+        (org-dayflow-demo-mode 1)
+        (should (equal (org-dayflow-demo-files) org-agenda-files))
+        (org-dayflow-demo-mode -1))
+      (should (equal '("/nowhere/real.org") org-agenda-files))
+      (should (equal '(("mine" . default)) org-dayflow-category-faces))
+      (should (= 0 (cl-count-if
+                    (lambda (b) (string-prefix-p "*Org Dayflow(" (buffer-name b)))
+                    (buffer-list)))))))
+
 (provide 'org-dayflow-test)
 
 ;;; org-dayflow-test.el ends here
