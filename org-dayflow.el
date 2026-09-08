@@ -93,8 +93,12 @@ room left to read it in."
   :type 'integer
   :group 'org-dayflow)
 
-(defcustom org-dayflow-default-span 'month
-  "Period shown when none is asked for."
+(defcustom org-dayflow-default-span 'week
+  "Period shown when none is asked for.
+
+A week and a bit, with a few days of it behind you.  It is the horizon a
+day is actually planned against: far enough to see what is coming, near
+enough that the days are still days rather than columns."
   :type 'symbol
   :group 'org-dayflow)
 
