@@ -38,9 +38,13 @@
 (require 'calendar)
 (require 'org)
 (require 'org-element)
-;; For `org-with-remote-undo' and the two variables it reads, which live in
-;; the agenda even though this is not one.
-(require 'org-agenda)
+;; `org-with-remote-undo' and the two variables it reads live in the agenda
+;; even though this is not one.  Wanted while compiling, for the macro, and
+;; while running by the single function that uses it -- which asks for it
+;; itself.  Loading the agenda here would mean no timeline could be drawn
+;; without one, and an agenda arrives with whatever a configuration has hung
+;; off it.
+(eval-when-compile (require 'org-agenda))
 
 (defgroup org-dayflow nil
   "Simple flowing timeline view for Org."
@@ -1126,6 +1130,10 @@ Display MESSAGE along with the timestamp."
   (interactive)
   (let ((marker (get-text-property (point) 'org-marker)))
     (unless marker (user-error "No task at point"))
+    ;; The agenda, for `org-with-remote-undo' and the two variables its
+    ;; expansion reads.  Here rather than at the top of the file: this is the
+    ;; only thing in the package that needs it.
+    (require 'org-agenda)
     (org-with-remote-undo (marker-buffer marker)
       (with-current-buffer (marker-buffer marker)
         (widen)
