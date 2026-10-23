@@ -1721,31 +1721,6 @@ overlays without ever modifying the read-only buffer."
     (delete-overlay org-dayflow--cursor-unit-overlay))
   (setq org-dayflow--cursor-unit-overlay nil))
 
-(defun org-dayflow--header-line-string ()
-  "Return a compact context string for `header-line-format'."
-  (let* ((cell (org-dayflow--cursor-cell))
-         (unit-dt (and cell (org-dayflow--unit-index-to-datetime cell)))
-         ;; From the row's own node: this runs on every redisplay, and
-         ;; reading the Org buffer here meant visiting it each time.
-         (node (org-dayflow--node-at-point))
-         (task-dt (and node (org-dayflow--task-anchor-datetime
-                             (org-dayflow--node-task node))))
-         (parts (delq nil
-                      (list
-                       (when unit-dt
-                         (format "col %s" (org-dayflow--format-datetime-short unit-dt)))
-                       (when task-dt
-                         (format "task %s" (org-dayflow--format-datetime-short task-dt)))
-                       (format "%s" org-dayflow--current-span)))))
-    (mapconcat #'identity parts "  |  ")))
-
-(defun org-dayflow--update-header-line ()
-  "Refresh `header-line-format' with column / task date context."
-  (when (derived-mode-p 'org-dayflow-mode)
-    (setq header-line-format
-          (list " "
-                '(:eval (org-dayflow--header-line-string))))))
-
 (defun org-dayflow--update-cursor-highlight ()
   "Redraw cursor column / unit overlays for the current cursor position.
 Assumes `org-dayflow--render' pre-padded every grid row and the
@@ -1755,8 +1730,6 @@ to keep alignment correct on rows containing multi-column
 characters."
   (when (derived-mode-p 'org-dayflow-mode)
     (org-dayflow--clear-cursor-highlight)
-    (org-dayflow--update-header-line)
-    (force-mode-line-update)
     (let ((cell (org-dayflow--cursor-cell))
           (grid org-dayflow--grid-start)
           (unit org-dayflow--unit-line-start))
@@ -1830,8 +1803,7 @@ characters."
         (setq org-dayflow--unit-line-start unit-line-start)
         (setq org-dayflow--grid-start grid-start)
         (setq org-dayflow--body-start body-start))
-      (goto-char (or org-dayflow--body-start (point-min)))
-      (org-dayflow--update-header-line))))
+      (goto-char (or org-dayflow--body-start (point-min))))))
 
 ;;; User commands
 (defun org-dayflow-refresh ()
@@ -2394,7 +2366,6 @@ Respects `org-dayflow-restore-windows-after-quit' and the value of
   (setq-local indent-tabs-mode nil)
   (setq org-dayflow--visible-depth org-dayflow-visible-depth
         org-dayflow--folds (make-hash-table :test #'equal))
-  (org-dayflow--update-header-line)
   (add-hook 'post-command-hook #'org-dayflow--update-cursor-highlight nil t))
 
 (provide 'org-dayflow)
