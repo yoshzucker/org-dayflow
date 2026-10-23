@@ -183,6 +183,16 @@ a generic hook; populate it in your own configuration, not in the package."
   :type 'boolean
   :group 'org-dayflow)
 
+(defcustom org-dayflow-visible-depth 2
+  "How many levels of the outline a new view shows.
+A row with rows under it is drawn across the dates of its whole
+subtree, so folding it keeps where its work falls and drops only
+the detail.  1 shows the top-level headings alone, 2 those and
+what is directly under them; nil shows everything.  `S-TAB' cycles
+it and `TAB' folds one row."
+  :type '(choice (const :tag "Everything" nil) integer)
+  :group 'org-dayflow)
+
 (defcustom org-dayflow-window-setup 'other-window
   "How the Dayflow buffer should be displayed.
 The value is passed to `org-dayflow-prepare-window' and controls
@@ -329,6 +339,23 @@ cursor currently sits on, and redrawn on every cursor movement."
   "Face for done-state (DONE/CANCEL/DELEG) task titles."
   :group 'org-dayflow)
 
+(defface org-dayflow-summary-face
+  '((t (:weight bold)))
+  "Face added to the title of a row that has rows under it.
+Bold, so the headings a month is organised by stand out from the
+tasks they are made of."
+  :group 'org-dayflow)
+
+(defface org-dayflow-milestone-face
+  '((t (:inherit org-warning)))
+  "Face for a deadline marked on a parent's line."
+  :group 'org-dayflow)
+
+(defface org-dayflow-milestone-done-face
+  '((t (:inherit org-headline-done)))
+  "Face for a met deadline marked on a parent's line."
+  :group 'org-dayflow)
+
 (defvar-local org-dayflow--current-span nil
   "Period the org-dayflow buffer is showing.")
 
@@ -362,6 +389,16 @@ cursor currently sits on, and redrawn on every cursor movement."
 (defvar-local org-dayflow--cursor-unit-overlay nil
   "Overlay highlighting the unit label under the cursor.")
 
+(defvar-local org-dayflow--visible-depth nil
+  "Levels shown in this buffer; starts as `org-dayflow-visible-depth'.")
+
+(defvar-local org-dayflow--folds nil
+  "Rows folded or opened by hand: node key -> `open' or `folded'.
+Overrides `org-dayflow--visible-depth' for that row.")
+
+(defvar-local org-dayflow--tree-depth 0
+  "Levels in the outline last rendered, for `org-dayflow-cycle-depth'.")
+
 (defvar org-dayflow--query-session nil
   "List of queries built during this session (not saved persistently).")
 
@@ -370,7 +407,9 @@ cursor currently sits on, and redrawn on every cursor movement."
     (set-keymap-parent map special-mode-map)
     (define-key map (kbd "q") #'org-dayflow-quit)
     (define-key map (kbd "RET") #'org-dayflow-switch-to)
-    (define-key map (kbd "TAB") #'org-dayflow-goto)
+    (define-key map (kbd "SPC") #'org-dayflow-show)
+    (define-key map (kbd "TAB") #'org-dayflow-toggle-fold)
+    (define-key map (kbd "<backtab>") #'org-dayflow-cycle-depth)
     (define-key map (kbd "r") #'org-dayflow-refresh)
     (define-key map (kbd "-") #'org-dayflow-span-zoom-out)
     (define-key map (kbd "+") #'org-dayflow-span-zoom-in)
@@ -778,11 +817,13 @@ the first keyword-less active timestamp (body or heading)."
 (defun org-dayflow--title-unit (start task-date)
   "Return the position (unit offset) for TASK-DATE from START depending on current scale."
   (pcase (org-dayflow--span-unit)
-    ('hour    (/ (- (org-dayflow--datetime-to-minutes task-date)
-                    (org-dayflow--datetime-to-minutes start))
-                 60))
+    ;; `floor', not `/': a date before START belongs to a cell left of the
+    ;; view, and `/' truncates towards zero and would put it in cell 0.
+    ('hour    (floor (- (org-dayflow--datetime-to-minutes task-date)
+                        (org-dayflow--datetime-to-minutes start))
+                     60))
     ('day     (org-dayflow--day- task-date start))
-    ('week    (/ (org-dayflow--day- task-date start) 7))
+    ('week    (floor (org-dayflow--day- task-date start) 7))
     ('month   (org-dayflow--month- task-date start))
     ('year    (- (nth 2 task-date) (nth 2 start)))
     (_        (org-dayflow--day- task-date start))))
@@ -854,21 +895,121 @@ the first keyword-less active timestamp (body or heading)."
      (t
       (append wellformed (list append-query))))))
 
-(defun org-dayflow--select-entries (query)
-  "Return a list of task plists matching QUERY across `org-agenda-files'.
-QUERY is an S-expression understood by `org-dayflow--query-matches-p'."
-  (let (tasks)
+(cl-defstruct (org-dayflow--node (:constructor org-dayflow--node-create)
+                                 (:copier nil))
+  "One heading, and what its subtree adds up to.
+
+START and END bound every date in the subtree, MILESTONES are its
+deadlines as (DATETIME . DONE) -- both over the whole subtree,
+whether or not QUERY shows the rest of it, so a parent's line does
+not shrink as its children are done.  SHOWN is whether the heading
+or anything under it matches the query.  KEY names the heading
+across renders: its file and its outline path, innermost first."
+  task level key match children start end milestones shown)
+
+(defun org-dayflow--task-milestones (task)
+  "Return TASK's own deadline as a list of (DATETIME . DONE), or nil."
+  (let ((dt (org-dayflow--datetime-timestamp (plist-get task :deadline))))
+    (and dt (list (cons dt (and (org-dayflow--task-done-p task) t))))))
+
+(defun org-dayflow--node-finish (node)
+  "Put NODE's children in file order and add up its subtree."
+  (let* ((task (org-dayflow--node-task node))
+         (kids (nreverse (org-dayflow--node-children node)))
+         (starts (delq nil (list (plist-get task :working-start)
+                                 (plist-get task :occupation-start))))
+         (ends (delq nil (list (plist-get task :working-end)
+                               (plist-get task :occupation-end))))
+         (milestones (org-dayflow--task-milestones task)))
+    (setf (org-dayflow--node-children node) kids)
+    (dolist (kid kids)
+      (org-dayflow--node-finish kid)
+      (when (org-dayflow--node-start kid)
+        (push (org-dayflow--node-start kid) starts)
+        (push (org-dayflow--node-end kid) ends))
+      (setq milestones (append milestones (org-dayflow--node-milestones kid))))
+    (setf (org-dayflow--node-start node)
+          (and starts (org-dayflow--datetime-min starts))
+          (org-dayflow--node-end node)
+          (and ends (org-dayflow--datetime-max ends))
+          (org-dayflow--node-milestones node) milestones
+          (org-dayflow--node-shown node)
+          (or (org-dayflow--node-match node)
+              (cl-some #'org-dayflow--node-shown kids)))))
+
+(defun org-dayflow--file-nodes (query)
+  "Return the top-level nodes of the current buffer's outline.
+Every heading becomes a node, matching QUERY or not: what a parent
+spans is decided by all of its children."
+  (let (roots stack)
+    (org-map-entries
+     (lambda ()
+       (let ((level (org-outline-level))
+             (task (org-dayflow--extract-task)))
+         (while (and stack (>= (org-dayflow--node-level (car stack)) level))
+           (pop stack))
+         (let ((node (org-dayflow--node-create
+                      :task task :level level
+                      :match (org-dayflow--query-matches-p query)
+                      :key (cons (buffer-file-name)
+                                 (cons (plist-get task :title)
+                                       (and stack (cdr (org-dayflow--node-key
+                                                        (car stack)))))))))
+           (if stack
+               (push node (org-dayflow--node-children (car stack)))
+             (push node roots))
+           (push node stack))))
+     nil 'file)
+    (setq roots (nreverse roots))
+    (mapc #'org-dayflow--node-finish roots)
+    roots))
+
+(defun org-dayflow--prune (nodes)
+  "Keep the NODES that are shown, and the shown nodes under them."
+  (cl-loop for node in nodes
+           when (org-dayflow--node-shown node)
+           do (setf (org-dayflow--node-children node)
+                    (org-dayflow--prune (org-dayflow--node-children node)))
+           and collect node))
+
+(defun org-dayflow--select-tree (query)
+  "Return the outline of `org-agenda-files' as far as QUERY shows it.
+A heading is kept when it or something under it matches, so a match
+arrives with the headings it belongs to."
+  (let (roots)
     (dolist (file (org-agenda-files))
       (when (file-exists-p file)
         (with-current-buffer (find-file-noselect file)
           ;; Ensure Org's keyword and tag caches are populated for this buffer.
           (org-set-regexps-and-options nil)
-          (org-map-entries
-           (lambda ()
-             (when (org-dayflow--query-matches-p query)
-               (push (org-dayflow--extract-task) tasks)))
-           nil 'file))))
-    (nreverse tasks)))
+          (setq roots (append roots (org-dayflow--file-nodes query))))))
+    (org-dayflow--prune roots)))
+
+(defun org-dayflow--leaf-tasks (nodes)
+  "Return the tasks of the rows under NODES that have no rows under them.
+These are the work; a parent row only adds its children up."
+  (cl-loop for node in nodes
+           append (if (org-dayflow--node-children node)
+                      (org-dayflow--leaf-tasks (org-dayflow--node-children node))
+                    (list (org-dayflow--node-task node)))))
+
+(defun org-dayflow--tree-depth-of (nodes)
+  "Return how many levels deep NODES go."
+  (if nodes
+      (1+ (apply #'max (mapcar (lambda (node)
+                                 (org-dayflow--tree-depth-of
+                                  (org-dayflow--node-children node)))
+                               nodes)))
+    0))
+
+(defun org-dayflow--node-open-p (node depth)
+  "Return non-nil if NODE, DEPTH levels down, shows its children."
+  (pcase (and org-dayflow--folds
+              (gethash (org-dayflow--node-key node) org-dayflow--folds))
+    ('open t)
+    ('folded nil)
+    (_ (or (null org-dayflow--visible-depth)
+           (< (1+ depth) org-dayflow--visible-depth)))))
 
 (defun org-dayflow--query-matches-p (query)
   "Return non-nil if the Org heading at point satisfies QUERY.
@@ -1290,20 +1431,119 @@ item navigation still finds the row from column 0."
   (cl-destructuring-bind (&key title marker &allow-other-keys) task
     (let* ((bol (point))
            (prefix (make-string (* offset unit-char-width) ?\s))
-           (done (org-dayflow--task-done-p task))
-           (face (cond
-                  (done 'org-dayflow-title-done-face)
-                  ((org-dayflow--category-face task))
-                  (t (with-current-buffer (marker-buffer marker)
-                       (save-excursion
-                         (goto-char marker)
-                         (org-dayflow--get-heading-face)))))))
+           (face (org-dayflow--title-face task)))
       (insert prefix)
       (let ((label-start (point)))
         (insert "*" title)
         (add-text-properties label-start (point) (list 'face face)))
       (put-text-property bol (point) 'org-marker marker)
       (insert "\n"))))
+
+(defun org-dayflow--title-face (task)
+  "Face for TASK's title: done, else its category's, else its level's."
+  (cond
+   ((org-dayflow--task-done-p task) 'org-dayflow-title-done-face)
+   ((org-dayflow--category-face task))
+   (t (let ((marker (plist-get task :marker)))
+        (with-current-buffer (marker-buffer marker)
+          (save-excursion
+            (goto-char marker)
+            (org-dayflow--get-heading-face)))))))
+
+(defun org-dayflow--summary-milestones (node open start units)
+  "Return ((CELL . FACE) ...) for the deadlines NODE's row marks.
+Folded, the row stands for its subtree and marks every deadline in
+it; OPEN, the children show their own and the row marks only its
+own.  START and UNITS are the view's."
+  (let (cells)
+    (pcase-dolist (`(,dt . ,done)
+                   (if open
+                       (org-dayflow--task-milestones (org-dayflow--node-task node))
+                     (org-dayflow--node-milestones node)))
+      (let ((cell (org-dayflow--title-unit start dt)))
+        (when (and (<= 0 cell) (< cell units))
+          (let ((face (if done 'org-dayflow-milestone-done-face
+                        'org-dayflow-milestone-face))
+                (old (assq cell cells)))
+            ;; One that is still open outranks one met on the same cell.
+            (cond ((not old) (push (cons cell face) cells))
+                  ((not done) (setcdr old face)))))))
+    cells))
+
+(defun org-dayflow--insert-summary (node open start units unit-char-width)
+  "Insert NODE's row as a line across the dates of its whole subtree.
+
+The title starts where the subtree does, after a ▾ when OPEN and a
+▸ when folded, and a rule runs on to where it ends, with a ◆ on
+each deadline from `org-dayflow--summary-milestones'.  A deadline
+that falls under the title is marked by colouring its cell instead.
+Return nil, inserting nothing, when the subtree misses the view."
+  (let ((s (org-dayflow--node-start node))
+        (e (org-dayflow--node-end node)))
+    (when (and s e)
+      (let* ((first (org-dayflow--title-unit start s))
+             ;; END is exclusive: its cell is that of the minute before.
+             (last (max first
+                        (org-dayflow--title-unit
+                         start (org-dayflow--minutes-to-datetime
+                                (1- (org-dayflow--datetime-to-minutes e)))))))
+        (when (and (< first units) (>= last 0))
+          (let* ((task (org-dayflow--node-task node))
+                 (face (org-dayflow--title-face task))
+                 (end-col (* (min units (1+ last)) unit-char-width))
+                 (milestones (org-dayflow--summary-milestones
+                              node open start units))
+                 (bol (point))
+                 label-end)
+            (insert (make-string (* (max 0 first) unit-char-width) ?\s))
+            (insert (propertize (concat (if open "▾" "▸") (plist-get task :title))
+                                'face (list 'org-dayflow-summary-face face)))
+            (setq label-end (current-column))
+            (when (< label-end end-col) (insert " "))
+            (while (< (current-column) end-col)
+              (let ((ms (assq (/ (current-column) unit-char-width) milestones)))
+                (if (not ms)
+                    (insert (propertize "─" 'face face))
+                  (insert (propertize "◆" 'face (cdr ms)))
+                  (setq milestones (delq ms milestones)))))
+            (pcase-dolist (`(,cell . ,ms-face) milestones)
+              (let ((left (org-dayflow--pos-at-column (* cell unit-char-width)))
+                    (right (org-dayflow--pos-at-column
+                            (* (1+ cell) unit-char-width))))
+                (when (< left right)
+                  (add-face-text-property left right ms-face))))
+            (add-text-properties bol (point)
+                                 (list 'org-marker (plist-get task :marker)
+                                       'org-dayflow-node node
+                                       'org-dayflow-open open))
+            (insert "\n")
+            t))))))
+
+(defun org-dayflow--insert-nodes (nodes depth start units unit-char-width)
+  "Insert a row for each of NODES, DEPTH levels down, and the open ones' children.
+A row with rows under it is a summary line; a row without is a task
+drawn as before, at its own date and only when that date is in view."
+  (dolist (node nodes)
+    (let ((task (org-dayflow--node-task node))
+          (kids (org-dayflow--node-children node)))
+      (if kids
+          (let ((open (org-dayflow--node-open-p node depth)))
+            (when (and (org-dayflow--insert-summary
+                        node open start units unit-char-width)
+                       open)
+              (org-dayflow--insert-nodes kids (1+ depth)
+                                         start units unit-char-width)))
+        (let ((offset (org-dayflow--title-position task start units)))
+          ;; No row, nothing to paint: the regions are drawn on the line
+          ;; just inserted, and without one they land on someone else's.
+          (when offset
+            (org-dayflow--insert-title task offset unit-char-width)
+            (put-text-property (line-beginning-position 0) (line-end-position 0)
+                               'org-dayflow-node node)
+            (org-dayflow--draw-occupation-background
+             (org-dayflow--occupation-region task start units unit-char-width))
+            (org-dayflow--draw-working-box
+             (org-dayflow--working-region task start units unit-char-width))))))))
 
 (defun org-dayflow--range-region (start-dt end-dt view-start units unit-char-width)
   "Return (BAR-POS-START . BAR-POS-END) of the character span covering
@@ -1533,8 +1773,11 @@ characters."
          (units (org-dayflow--units-length))
          (label-lines (org-dayflow--scale-lines org-dayflow--current-span start units
                                                 unit-char-width))
-         (tasks (org-dayflow--select-entries
-                 (org-dayflow--build-query org-dayflow--current-query))))
+         (tree (org-dayflow--select-tree
+                (org-dayflow--build-query org-dayflow--current-query)))
+         ;; The load is the work, whatever is folded; parents only add up.
+         (tasks (org-dayflow--leaf-tasks tree)))
+    (setq org-dayflow--tree-depth (org-dayflow--tree-depth-of tree))
     (let ((inhibit-read-only t))
       (rename-buffer (org-dayflow--buffer-name org-dayflow--current-span) t)
       (erase-buffer)
@@ -1557,15 +1800,10 @@ characters."
         (setq grid-start (point))
         (org-dayflow--insert-sparkline tasks start units unit-char-width)
         (unless org-dayflow-high-density (insert "\n"))
-        (setq body-start (point))
-        (dolist (task tasks)
-          (let ((offset (org-dayflow--title-position task start units)))
-            (when offset
-              (org-dayflow--insert-title task offset unit-char-width)))
-          (org-dayflow--draw-occupation-background
-           (org-dayflow--occupation-region task start units unit-char-width))
-          (org-dayflow--draw-working-box
-           (org-dayflow--working-region task start units unit-char-width)))
+        ;; A marker: padding the lines above to full width comes later, and
+        ;; would leave a position on the blank line before the first row.
+        (setq body-start (point-marker))
+        (org-dayflow--insert-nodes tree 0 start units unit-char-width)
         (org-dayflow--pad-grid-to-full-width grid-start units unit-char-width)
         ;; Bands first (lowest visual priority), then now-column on top.
         (org-dayflow--draw-column-bands grid-start start units unit-char-width)
@@ -1706,6 +1944,67 @@ At the first task, says so rather than moving anywhere."
           (goto-char marker)
           (org-fold-show-entry))
       (message "No task at point."))))
+
+(defun org-dayflow-show ()
+  "Show the Org heading at point in another window, staying here."
+  (interactive)
+  (let ((marker (get-text-property (line-beginning-position) 'org-marker)))
+    (if (not (and marker (marker-buffer marker)))
+        (message "No task at point.")
+      (save-excursion
+        (beginning-of-line)
+        (org-dayflow--follow))
+      (org-dayflow--highlight-current-heading marker))))
+
+(defun org-dayflow--goto-key (key)
+  "Move to the row of the heading named KEY, or of its nearest shown ancestor.
+KEY is a node key: a file and an outline path, innermost first."
+  (let (found)
+    (while (and key (cdr key) (not found))
+      (save-excursion
+        (goto-char (or org-dayflow--body-start (point-min)))
+        (while (and (not found) (not (eobp)))
+          (let ((node (get-text-property (point) 'org-dayflow-node)))
+            (if (and node (equal (org-dayflow--node-key node) key))
+                (setq found (point))
+              (forward-line 1)))))
+      (setq key (cons (car key) (cddr key))))
+    (when found
+      (goto-char found)
+      (org-dayflow--move-to-title))))
+
+(defun org-dayflow--node-at-point ()
+  "Return the node of the row at point, or nil."
+  (get-text-property (line-beginning-position) 'org-dayflow-node))
+
+(defun org-dayflow-toggle-fold ()
+  "Fold the row at point into its line, or open it to show its children."
+  (interactive)
+  (let ((node (org-dayflow--node-at-point)))
+    (unless (and node (org-dayflow--node-children node))
+      (user-error "Nothing under this row to fold"))
+    (unless org-dayflow--folds
+      (setq org-dayflow--folds (make-hash-table :test #'equal)))
+    (puthash (org-dayflow--node-key node)
+             (if (get-text-property (line-beginning-position) 'org-dayflow-open)
+                 'folded
+               'open)
+             org-dayflow--folds)
+    (org-dayflow-refresh)
+    (org-dayflow--goto-key (org-dayflow--node-key node))))
+
+(defun org-dayflow-cycle-depth ()
+  "Show one level more of the outline; after the deepest, the top level alone.
+Forgets the rows folded or opened by hand, as Org's own cycling does."
+  (interactive)
+  (let ((node (org-dayflow--node-at-point))
+        (depth (or org-dayflow--visible-depth org-dayflow--tree-depth)))
+    (setq org-dayflow--visible-depth
+          (if (>= depth org-dayflow--tree-depth) 1 (1+ depth)))
+    (when org-dayflow--folds (clrhash org-dayflow--folds))
+    (org-dayflow-refresh)
+    (when node (org-dayflow--goto-key (org-dayflow--node-key node)))
+    (message "Depth %d/%d" org-dayflow--visible-depth org-dayflow--tree-depth)))
 
 (defun org-dayflow-bury-buffer ()
   "Bury the Dayflow buffer (simple variant of `org-dayflow-quit').
@@ -2095,6 +2394,8 @@ Respects `org-dayflow-restore-windows-after-quit' and the value of
   "Major mode for viewing Org tasks in a dayflow timeline."
   :keymap org-dayflow-mode-map
   (setq-local truncate-lines t)
+  (setq org-dayflow--visible-depth org-dayflow-visible-depth
+        org-dayflow--folds (make-hash-table :test #'equal))
   (org-dayflow--update-header-line)
   (add-hook 'post-command-hook #'org-dayflow--update-cursor-highlight nil t))
 
