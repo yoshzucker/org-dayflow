@@ -193,6 +193,19 @@ it and `TAB' folds one row."
   :type '(choice (const :tag "Everything" nil) integer)
   :group 'org-dayflow)
 
+(defcustom org-dayflow-merge-repeats t
+  "If non-nil, draw the occurrences of one repeating event on one row.
+A calendar mirrored into Org writes a weekly meeting as a heading
+per week rather than as one heading with a repeater, and each would
+take a row of its own.  Headings without rows under them that have
+the same title are taken to be one event, wherever they are in the
+outline: its title is written once, at the first occurrence in view,
+and every occurrence is marked on the line.  The cell under point
+names its own occurrence, so `RET' and the editing commands act on
+the one under the cursor."
+  :type 'boolean
+  :group 'org-dayflow)
+
 (defcustom org-dayflow-window-setup 'other-window
   "How the Dayflow buffer should be displayed.
 The value is passed to `org-dayflow-prepare-window' and controls
@@ -1519,31 +1532,100 @@ Return nil, inserting nothing, when the subtree misses the view."
             (insert "\n")
             t))))))
 
-(defun org-dayflow--insert-nodes (nodes depth start units unit-char-width)
+(defun org-dayflow--repeat-groups (nodes)
+  "Return a table from each task row under NODES to its repeats.
+A task row is a node without children that is not folded away; its
+repeats are the task rows with the same title, wherever they are in
+the outline.  Each maps to the list of all of them, itself included,
+in outline order.  Nil when `org-dayflow-merge-repeats' is off."
+  (when org-dayflow-merge-repeats
+    (let ((by-title (make-hash-table :test #'equal))
+          (groups (make-hash-table :test #'eq)))
+      (cl-labels ((walk (nodes depth)
+                    (dolist (node nodes)
+                      (let ((kids (org-dayflow--node-children node)))
+                        (cond
+                         ((not kids)
+                          (push node (gethash (plist-get (org-dayflow--node-task node)
+                                                         :title)
+                                              by-title)))
+                         ((org-dayflow--node-open-p node depth)
+                          (walk kids (1+ depth))))))))
+        (walk nodes 0))
+      (maphash (lambda (_title group)
+                 (setq group (nreverse group))
+                 (dolist (node group) (puthash node group groups)))
+               by-title)
+      groups)))
+
+(defun org-dayflow--insert-occurrences (nodes start units unit-char-width)
+  "Insert one row for NODES, the occurrences of one event.
+The title is written once, at the earliest occurrence in view, and
+each occurrence in view has its range painted on the line.  The
+cells an occurrence covers carry its own marker and node, so what
+is under point is the occurrence in that column.  Insert nothing
+when none of them is in view."
+  (let ((shown (sort (cl-loop for node in nodes
+                              for offset = (org-dayflow--title-position
+                                            (org-dayflow--node-task node)
+                                            start units)
+                              when offset collect (cons offset node))
+                     #'car-less-than-car)))
+    (when shown
+      (let ((first (cdar shown)))
+        (org-dayflow--insert-title (org-dayflow--node-task first)
+                                   (caar shown) unit-char-width)
+        (put-text-property (line-beginning-position 0) (line-end-position 0)
+                           'org-dayflow-node first))
+      ;; No row, nothing to paint: the regions are drawn on the line
+      ;; just inserted, and without one they land on someone else's.
+      (pcase-dolist (`(,offset . ,node) shown)
+        (let* ((task (org-dayflow--node-task node))
+               (occupation (org-dayflow--occupation-region
+                            task start units unit-char-width))
+               (working (org-dayflow--working-region
+                         task start units unit-char-width)))
+          (org-dayflow--draw-occupation-background occupation)
+          (org-dayflow--draw-working-box working)
+          (when (cdr shown)
+            (let ((props (list 'org-marker (plist-get task :marker)
+                               'org-dayflow-node node)))
+              (dolist (region (list occupation working
+                                    (org-dayflow--cell-region
+                                     offset unit-char-width)))
+                (when region
+                  (add-text-properties (car region) (cdr region) props))))))))))
+
+(defun org-dayflow--cell-region (offset unit-char-width)
+  "Return (START . END) of cell OFFSET on the line before point."
+  (save-excursion
+    (forward-line -1)
+    (move-to-column (* offset unit-char-width) t)
+    (let ((left (point)))
+      (move-to-column (* (1+ offset) unit-char-width) t)
+      (cons left (point)))))
+
+(defun org-dayflow--insert-nodes (nodes depth start units unit-char-width
+                                         &optional repeats)
   "Insert a row for each of NODES, DEPTH levels down, and the open ones' children.
 A row with rows under it is a summary line; a row without is a task
-drawn as before, at its own date and only when that date is in view."
+drawn as before, at its own date and only when that date is in view.
+REPEATS is a table from `org-dayflow--repeat-groups': repeats of one
+event share the row of the first of them."
   (dolist (node nodes)
-    (let ((task (org-dayflow--node-task node))
-          (kids (org-dayflow--node-children node)))
-      (if kids
-          (let ((open (org-dayflow--node-open-p node depth)))
-            (when (and (org-dayflow--insert-summary
-                        node open start units unit-char-width)
-                       open)
-              (org-dayflow--insert-nodes kids (1+ depth)
-                                         start units unit-char-width)))
-        (let ((offset (org-dayflow--title-position task start units)))
-          ;; No row, nothing to paint: the regions are drawn on the line
-          ;; just inserted, and without one they land on someone else's.
-          (when offset
-            (org-dayflow--insert-title task offset unit-char-width)
-            (put-text-property (line-beginning-position 0) (line-end-position 0)
-                               'org-dayflow-node node)
-            (org-dayflow--draw-occupation-background
-             (org-dayflow--occupation-region task start units unit-char-width))
-            (org-dayflow--draw-working-box
-             (org-dayflow--working-region task start units unit-char-width))))))))
+    (let ((kids (org-dayflow--node-children node))
+          (group (or (and repeats (gethash node repeats)) (list node))))
+      (cond
+       (kids
+        (let ((open (org-dayflow--node-open-p node depth)))
+          (when (and (org-dayflow--insert-summary
+                      node open start units unit-char-width)
+                     open)
+            (org-dayflow--insert-nodes kids (1+ depth)
+                                       start units unit-char-width repeats))))
+       ((eq node (car group))
+        (org-dayflow--insert-occurrences group start units
+                                         unit-char-width))))))
 
 (defun org-dayflow--range-region (start-dt end-dt view-start units unit-char-width)
   "Return (BAR-POS-START . BAR-POS-END) of the character span covering
@@ -1803,7 +1885,8 @@ characters."
         ;; A marker: padding the lines above to full width comes later, and
         ;; would leave a position on the blank line before the first row.
         (setq body-start (point-marker))
-        (org-dayflow--insert-nodes tree 0 start units unit-char-width)
+        (org-dayflow--insert-nodes tree 0 start units unit-char-width
+                                   (org-dayflow--repeat-groups tree))
         (org-dayflow--pad-grid-to-full-width grid-start units unit-char-width)
         ;; Bands first (lowest visual priority), then now-column on top.
         (org-dayflow--draw-column-bands grid-start start units unit-char-width)
@@ -1946,15 +2029,20 @@ At the first task, says so rather than moving anywhere."
       (message "No task at point."))))
 
 (defun org-dayflow-show ()
-  "Show the Org heading at point in another window, staying here."
+  "Show the Org heading at point in another window, staying here.
+On a row of repeats, the occurrence under point; elsewhere on the
+row, the row's own heading."
   (interactive)
-  (let ((marker (get-text-property (line-beginning-position) 'org-marker)))
-    (if (not (and marker (marker-buffer marker)))
-        (message "No task at point.")
-      (save-excursion
-        (beginning-of-line)
-        (org-dayflow--follow))
-      (org-dayflow--highlight-current-heading marker))))
+  (let ((pos (if (get-text-property (point) 'org-marker)
+                 (point)
+               (line-beginning-position))))
+    (let ((marker (get-text-property pos 'org-marker)))
+      (if (not (and marker (marker-buffer marker)))
+          (message "No task at point.")
+        (save-excursion
+          (goto-char pos)
+          (org-dayflow--follow))
+        (org-dayflow--highlight-current-heading marker)))))
 
 (defun org-dayflow--goto-key (key)
   "Move to the row of the heading named KEY, or of its nearest shown ancestor.
@@ -2394,6 +2482,9 @@ Respects `org-dayflow-restore-windows-after-quit' and the value of
   "Major mode for viewing Org tasks in a dayflow timeline."
   :keymap org-dayflow-mode-map
   (setq-local truncate-lines t)
+  ;; Rows are lengthened with `move-to-column' to reach a range past their
+  ;; end, and a tab there would make one character of several cells.
+  (setq-local indent-tabs-mode nil)
   (setq org-dayflow--visible-depth org-dayflow-visible-depth
         org-dayflow--folds (make-hash-table :test #'equal))
   (org-dayflow--update-header-line)
