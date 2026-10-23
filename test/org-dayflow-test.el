@@ -23,26 +23,17 @@
 
 ;;;; How much of a period is on the screen
 
-(ert-deftest org-dayflow-test-a-week-fills-the-window ()
-  "Ten days at eight columns each is what eighty columns of a week look like.
-
-The period asks for ten columns and the window says how wide one may be, so
-a week comes out spread across the page -- which is the point.  Titles start
-at their own day and run right; a week packed into three-column cells piles
-every title on top of the left edge."
-  (should (= 8 (org-dayflow--unit-char-width 'week 80)))
-  (should (= 10 (org-dayflow--units-length 'week 80))))
-
 (ert-deftest org-dayflow-test-a-month-packs-its-days ()
-  "The same unit as a week and three times as many of them.
-
-`week' and `month' are both drawn a day to a column.  What separates them is
-how many columns they ask for, which is the whole reason a period rather
-than a unit is the thing being chosen."
-  (should (eq 'day (org-dayflow--span-unit 'week)))
+  "A month is drawn a day to a column, packed three characters wide."
   (should (eq 'day (org-dayflow--span-unit 'month)))
   (should (= 3 (org-dayflow--unit-char-width 'month 80)))
   (should (= 26 (org-dayflow--units-length 'month 80))))
+
+(ert-deftest org-dayflow-test-nothing-shorter-than-a-month ()
+  "The days of a week and the hours of a day are the agenda's."
+  (should (eq 'month (car (car org-dayflow-spans))))
+  (should-not (assq 'week org-dayflow-spans))
+  (should-not (assq 'day org-dayflow-spans)))
 
 (ert-deftest org-dayflow-test-every-period-fits-eighty-columns ()
   "None of them runs off the edge of the narrowest window worth drawing for."
@@ -99,9 +90,9 @@ column is.  The week row used to carry its own hardcoded format."
   "The offset is a share of the period, not a count of columns: the count
 follows the window, so a fixed one would put the past off the left edge of a
 wide window and swallow a narrow one."
-  (let ((org-dayflow-default-offsets '((week . -0.3) (month . -0.5))))
-    (org-dayflow--span-set 'week)
-    (should (= -3 org-dayflow--current-offset))   ; 0.3 of ten
+  (let ((org-dayflow-default-offsets '((quarter . -0.5) (month . -0.5))))
+    (org-dayflow--span-set 'quarter)
+    (should (= -7 org-dayflow--current-offset))   ; 0.5 of fourteen
     (org-dayflow--span-set 'month)
     (should (= -13 org-dayflow--current-offset)))) ; 0.5 of twenty-six
 
@@ -158,11 +149,19 @@ and the filter it built went nowhere."
        (list (cons ?. (lambda () nil)))))
     (should-not org-dayflow--current-query)))
 
-(ert-deftest org-dayflow-test-the-default-is-a-week ()
-  "A week and a bit is the horizon a day is planned against: far enough to
-see what is coming, near enough that the days are still days."
-  (should (eq 'week org-dayflow-default-span))
-  (should (string-match-p "week" (org-dayflow--buffer-name))))
+(ert-deftest org-dayflow-test-the-default-is-a-month ()
+  "A month: where each piece of work runs and where it is due."
+  (should (eq 'month org-dayflow-default-span))
+  (should (string-match-p "month" (org-dayflow--buffer-name))))
+
+(ert-deftest org-dayflow-test-d-is-the-default ()
+  "`d' opens the default period, now that there is no day to give it to."
+  (let (shown)
+    (cl-letf (((symbol-function 'read-key) (lambda (&rest _) ?d))
+              ((symbol-function 'org-dayflow-display)
+               (lambda (&optional span) (setq shown (or span 'default)))))
+      (org-dayflow))
+    (should (eq 'default shown))))
 
 ;;;; The demo
 
@@ -227,21 +226,18 @@ was last spring."
     (nreverse rows)))
 
 (ert-deftest org-dayflow-test-a-longer-period-shows-more ()
-  "The demo reaches past the week it opens on.
+  "The demo reaches past the month it opens on.
 
 A longer view that shows the same rows as a shorter one demonstrates
-nothing: what a month is *for* is the work that is not in this week, so the
-generated data has to have some."
+nothing, so the generated data has to have work beyond the month."
   (org-dayflow-test--with-demo
     (let ((org-agenda-files (org-dayflow-demo-regenerate))
           (org-todo-keywords '((sequence "NEXT" "ONGO" "|" "DONE" "CANCEL")
                                (sequence "WAIT" "|" "DELEG"))))
-      (let ((week (org-dayflow-test--rows 'week))
-            (month (org-dayflow-test--rows 'month))
+      (let ((month (org-dayflow-test--rows 'month))
             (quarter (org-dayflow-test--rows 'quarter))
             (year (org-dayflow-test--rows 'year)))
-        (should (> week 0))
-        (should (> month week))
+        (should (> month 0))
         (should (> quarter month))
         (should (> year quarter))))))
 
@@ -375,6 +371,68 @@ would count the same work twice."
       (should (= 2 (cl-count-if (lambda (c) (memq c (string-to-list
                                                      org-dayflow-spark-chars)))
                                 spark))))))
+
+;;;; What is drawn
+
+(defconst org-dayflow-test--dated
+  "* 案件
+** NEXT 長い作業
+SCHEDULED: <%-40> DEADLINE: <%60>
+** NEXT 期限切れ
+DEADLINE: <%-20>
+** NEXT 来月が期限
+SCHEDULED: <%2> DEADLINE: <%45>
+** NEXT 週次
+SCHEDULED: <%-30 +1w>
+** DONE 済んだ
+DEADLINE: <%-20>
+"
+  "Tasks whose one date is off the screen though their work is on it.")
+
+(ert-deftest org-dayflow-test-every-task-in-view-is-drawn ()
+  "A task is drawn when any of its range is in view.  Placed by its
+deadline alone, all four of these were left out of a month: one running
+across it, one overdue, one due after it, and one whose repeater date is
+behind it."
+  (org-dayflow-test--with-outline org-dayflow-test--dated
+    (let ((rows (org-dayflow-test--row-titles)))
+      (dolist (title '("*長い作業" "*期限切れ" "*来月が期限" "*週次"))
+        (should (member title rows))))))
+
+(ert-deftest org-dayflow-test-a-title-starts-where-the-work-does ()
+  "Scheduled in two days and due in forty-five: the title is at the
+schedule, not pushed off the right edge by the deadline."
+  (org-dayflow-test--with-outline org-dayflow-test--dated
+    (goto-char (point-min))
+    (search-forward "*来月が期限")
+    (goto-char (match-beginning 0))
+    (should (= (* (- 2 org-dayflow--current-offset)
+                  (org-dayflow--unit-char-width))
+               (current-column)))))
+
+(ert-deftest org-dayflow-test-tasks-are-not-repeats ()
+  "Two projects each with a step of the same name have two steps."
+  (org-dayflow-test--with-outline
+      "* A\n** NEXT 資料作成\nSCHEDULED: <%1>\n* B\n** NEXT 資料作成\nSCHEDULED: <%3>\n"
+    (should (= 2 (cl-count "*資料作成" (org-dayflow-test--row-titles)
+                           :test #'equal)))))
+
+(ert-deftest org-dayflow-test-excluded-files-are-not-read ()
+  "A file named in `org-dayflow-exclude-files', by name or by a function
+returning it, stays out of the timeline and nowhere else."
+  (let* ((a (make-temp-file "dfa" nil ".org"))
+         (b (make-temp-file "dfb" nil ".org"))
+         (org-agenda-files (list a b)))
+    (unwind-protect
+        (progn
+          (let ((org-dayflow-exclude-files (list b)))
+            (should (equal (list a) (org-dayflow--files))))
+          (let ((org-dayflow-exclude-files (list (lambda () b))))
+            (should (equal (list a) (org-dayflow--files))))
+          (let ((org-dayflow-exclude-files '(no-such-function)))
+            (should (equal (list a b) (org-dayflow--files)))))
+      (delete-file a)
+      (delete-file b))))
 
 (provide 'org-dayflow-test)
 
