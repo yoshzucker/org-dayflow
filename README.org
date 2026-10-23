@@ -111,6 +111,23 @@ where it is due.
 =org-dayflow-visible-depth= (default 2) is how many levels a new view shows;
 =S-TAB= cycles it, and =TAB= folds or opens one row.
 
+** Repeating events on one row
+
+A calendar mirrored into Org usually writes a weekly meeting as one heading
+per week, not as one heading with a =+1w= repeater, and each would take a row
+of its own.  Headings without rows under them that have the same title are
+drawn as one event on one row, wherever they sit in the outline: the title
+once, at the first occurrence in view, and every occurrence marked on the
+line.  The row stands where the first of them does.  A heading folded away
+under its parent is left to that parent's line.
+
+: *定例会議 ▮      ▮      ▮      ▮
+
+The cell under point is its own occurrence: =RET=, =SPC=, the header line and
+=s= / =d= / =t= act on the one in that column.  The sparkline still counts
+each occurrence.  =(setq org-dayflow-merge-repeats nil)= gives each heading
+its own row again.
+
 ** Customization
 
 #+begin_src emacs-lisp
