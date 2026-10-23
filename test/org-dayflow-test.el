@@ -410,8 +410,8 @@ schedule, not pushed off the right edge by the deadline."
                   (org-dayflow--unit-char-width))
                (current-column)))))
 
-(ert-deftest org-dayflow-test-tasks-are-not-repeats ()
-  "Two projects each with a step of the same name have two steps."
+(ert-deftest org-dayflow-test-a-name-is-not-a-row ()
+  "Two headings with the same title are two rows, wherever they are."
   (org-dayflow-test--with-outline
       "* A\n** NEXT 資料作成\nSCHEDULED: <%1>\n* B\n** NEXT 資料作成\nSCHEDULED: <%3>\n"
     (should (= 2 (cl-count "*資料作成" (org-dayflow-test--row-titles)

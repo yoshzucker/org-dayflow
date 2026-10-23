@@ -202,21 +202,6 @@ it and `TAB' folds one row."
   :type '(choice (const :tag "Everything" nil) integer)
   :group 'org-dayflow)
 
-(defcustom org-dayflow-merge-repeats t
-  "If non-nil, draw the occurrences of one repeating event on one row.
-A calendar mirrored into Org writes a weekly meeting as a heading
-per week rather than as one heading with a repeater, and each would
-take a row of its own.  Headings without rows under them or a TODO
-keyword that have the same title are taken to be one event, wherever
-they are in the outline: its title is written once, at the first
-occurrence in view, and every occurrence is marked on the line.
-Tasks are never merged -- two projects each with a step called
-\"draft\" have two steps, not one.  The cell under point
-names its own occurrence, so `RET' and the editing commands act on
-the one under the cursor."
-  :type 'boolean
-  :group 'org-dayflow)
-
 (defcustom org-dayflow-window-setup 'other-window
   "How the Dayflow buffer should be displayed.
 The value is passed to `org-dayflow-prepare-window' and controls
@@ -504,14 +489,14 @@ clamped below by what the unit\='s digits need and above by
     (format "%%0%dd%s" digits (make-string (max 1 (- width digits)) ?\s))))
 
 (defun org-dayflow--label-safe-pos (pos positions)
-  "Return the first position >= POS that does not overlap the last entry in POSITIONS.
+  "Return the first position >= POS clear of the last entry in POSITIONS.
 POSITIONS is a list of (pos label-string) in reverse-push order."
   (if (null positions)
       pos
     (max pos (+ (caar positions) (length (cadr (car positions)))))))
 
 (defun org-dayflow--render-label-positions (positions total-width)
-  "Render POSITIONS (sorted list of (pos label-string)) into a padded line of TOTAL-WIDTH chars."
+  "Render POSITIONS, sorted (POS LABEL) lists, as a line TOTAL-WIDTH wide."
   (let ((line ""))
     (dolist (entry positions)
       (setq line (concat line
@@ -528,36 +513,40 @@ POSITIONS is a list of (pos label-string) in reverse-push order."
                :initial-value base))))
 
 (defun org-dayflow--date-start ()
-  "Return the start date/datetime considering the current offset and scale."
-  (let ((today (org-dayflow--datetime-now))
-        (x org-dayflow--current-offset))
-    (pcase (org-dayflow--span-unit)
-      ('day     (org-dayflow--date+ today (list 0 x 0)))
-      ('week    (org-dayflow--date+ today (list 0 (* x 7) 0)))
-      ('month   (org-dayflow--date+ today (list x 0 0)))
-      ('year    (org-dayflow--date+ today (list 0 0 x)))
-      (_        (org-dayflow--date+ today (list 0 x 0))))))
+  "Return the date the view starts on, from today and the current offset."
+  (org-dayflow--date+ (org-dayflow--datetime-now)
+                      (org-dayflow--units-delta org-dayflow--current-offset)))
+
+(defun org-dayflow--units-delta (n)
+  "Return N units of the current period as a (MONTHS DAYS YEARS) delta."
+  (pcase (org-dayflow--span-unit)
+    ('week  (list 0 (* n 7) 0))
+    ('month (list n 0 0))
+    ('year  (list 0 0 n))
+    (_      (list 0 n 0))))
 
 (defun org-dayflow--day- (&rest dates)
   "Return the number of days between the first date and each of the rest."
   (cl-reduce #'- (mapcar #'calendar-absolute-from-gregorian dates)))
 
 (defun org-dayflow--month- (date1 date2)
-  "Return the number of whole months between DATE1 and DATE2 (month day year ...) lists."
-  (cl-destructuring-bind (m1 _d1 y1 . _r1) date1
-    (cl-destructuring-bind (m2 _d2 y2 . _r2) date2
-      (+ (* (- y1 y2) 12) (- m1 m2)))))
+  "Return the whole months from DATE2 to DATE1, both (month day year ...)."
+  (+ (* (- (nth 2 date1) (nth 2 date2)) 12)
+     (- (nth 0 date1) (nth 0 date2))))
+
+(defun org-dayflow--decoded-datetime (decoded)
+  "Return DECODED, a `decode-time' list, as (month day year hour minute)."
+  (list (nth 4 decoded) (nth 3 decoded) (nth 5 decoded)
+        (or (nth 2 decoded) 0) (or (nth 1 decoded) 0)))
 
 (defun org-dayflow--datetime-now ()
   "Return current time as (month day year hour minute)."
-  (cl-destructuring-bind (_sec min hour day month year . _rest) (decode-time (current-time))
-    (list month day year hour min)))
+  (org-dayflow--decoded-datetime (decode-time)))
 
 (defun org-dayflow--datetime-timestamp (timestamp)
-  "Convert Org TIMESTAMP to (month day year hour minute), or nil if TIMESTAMP is nil."
+  "Convert Org TIMESTAMP to (month day year hour minute), or nil if it is nil."
   (when timestamp
-    (cl-destructuring-bind (_sec min hour day month year . _rest) (org-parse-time-string timestamp)
-      (list month day year (or hour 0) (or min 0)))))
+    (org-dayflow--decoded-datetime (org-parse-time-string timestamp))))
 
 (defun org-dayflow--datetime-to-minutes (dt)
   "Convert (month day year hour minute) to absolute minutes."
@@ -697,19 +686,20 @@ frame is."
 
 (defun org-dayflow--month-scale-units (start months width)
   "Generate a line of month numbers for MONTH units, WIDTH columns each."
-  (cl-destructuring-bind (month _d1 year . _r1) start
-    (cl-destructuring-bind (today-month _d2 today-year . _r2) (org-dayflow--datetime-now)
-      (let ((fmt (org-dayflow--unit-format 'month width))
-            (line ""))
-        (dotimes (_i months)
-          (let* ((face (org-dayflow--unit-face
-                        (and (= month today-month) (= year today-year)))))
-            (setq line (concat line (propertize (format fmt month) 'face face))))
-          (setq month (1+ month))
-          (when (> month 12)
-            (setq month 1)
-            (setq year (1+ year))))
-        (string-trim-right line)))))
+  (let* ((now (org-dayflow--datetime-now))
+         (month (nth 0 start))
+         (year (nth 2 start))
+         (fmt (org-dayflow--unit-format 'month width))
+         (line ""))
+    (dotimes (_i months)
+      (let ((face (org-dayflow--unit-face
+                   (and (= month (nth 0 now)) (= year (nth 2 now))))))
+        (setq line (concat line (propertize (format fmt month) 'face face))))
+      (setq month (1+ month))
+      (when (> month 12)
+        (setq month 1)
+        (setq year (1+ year))))
+    (string-trim-right line)))
 
 (defun org-dayflow--year-scale-units (start years width)
   "Generate a line of year numbers, WIDTH columns each.
@@ -805,7 +795,7 @@ the first keyword-less active timestamp (body or heading)."
             (org-dayflow--element-end-datetime el)))))
 
 (defun org-dayflow--title-unit (start task-date)
-  "Return the position (unit offset) for TASK-DATE from START depending on current scale."
+  "Return the cell, counted in the current unit from START, of TASK-DATE."
   (pcase (org-dayflow--span-unit)
     ('day     (org-dayflow--day- task-date start))
     ;; `floor', not `/': a date before START belongs to a cell left of the
@@ -853,10 +843,26 @@ the first keyword-less active timestamp (body or heading)."
   (beginning-of-line)
   (skip-chars-forward " \t"))
 
+(defun org-dayflow--marker-at-point ()
+  "Return the Org marker of the row at point, or nil.
+Read from the start of the line: the marker covers a row's title and
+the blanks before it but not the padding after, and point past the
+title is still on the row."
+  (let ((marker (get-text-property (line-beginning-position) 'org-marker)))
+    (and marker (marker-buffer marker) marker)))
+
+(defun org-dayflow--arrive ()
+  "Settle on the row just moved to: the title, its echo, and follow mode."
+  (org-dayflow--move-to-title)
+  (org-dayflow-echo-info)
+  (when org-dayflow--follow-mode
+    (org-dayflow--follow)
+    (org-dayflow--highlight-current-heading (org-dayflow--marker-at-point))))
+
 (defun org-dayflow--follow ()
-  "If follow mode is on, display the Org heading at point in another window without switching focus."
-  (let ((marker (get-text-property (point) 'org-marker)))
-    (when (and marker (marker-buffer marker))
+  "Display the Org heading at point in another window, keeping focus here."
+  (let ((marker (org-dayflow--marker-at-point)))
+    (when marker
       (display-buffer (marker-buffer marker))
       (with-selected-window (get-buffer-window (marker-buffer marker))
         (goto-char marker)
@@ -903,10 +909,9 @@ across renders: its file and its outline path, innermost first."
   "Put NODE's children in file order and add up its subtree."
   (let* ((task (org-dayflow--node-task node))
          (kids (nreverse (org-dayflow--node-children node)))
-         (starts (delq nil (list (plist-get task :working-start)
-                                 (plist-get task :occupation-start))))
-         (ends (delq nil (list (plist-get task :working-end)
-                               (plist-get task :occupation-end))))
+         (range (org-dayflow--task-range task))
+         (starts (and range (list (car range))))
+         (ends (and range (list (cdr range))))
          (milestones (org-dayflow--task-milestones task)))
     (setf (org-dayflow--node-children node) kids)
     (dolist (kid kids)
@@ -1088,24 +1093,9 @@ Matches SCHEDULED, DEADLINE, or the first active TIMESTAMP day."
 
 (defun org-dayflow--unit-index-to-datetime (unit)
   "Return (month day year hour minute) for UNIT index in the current view."
-  (let ((start (org-dayflow--date-start)))
-    (pcase (org-dayflow--span-unit)
-      ('day
-       (let* ((start-abs (calendar-absolute-from-gregorian start))
-              (g (calendar-gregorian-from-absolute (+ start-abs unit))))
-         (list (nth 0 g) (nth 1 g) (nth 2 g) 0 0)))
-      ('week
-       (let* ((start-abs (calendar-absolute-from-gregorian start))
-              (g (calendar-gregorian-from-absolute (+ start-abs (* unit 7)))))
-         (list (nth 0 g) (nth 1 g) (nth 2 g) 0 0)))
-      ('month
-       (org-dayflow--date+ start (list unit 0 0)))
-      ('year
-       (org-dayflow--date+ start (list 0 0 unit)))
-      (_
-       (let* ((start-abs (calendar-absolute-from-gregorian start))
-              (g (calendar-gregorian-from-absolute (+ start-abs unit))))
-         (list (nth 0 g) (nth 1 g) (nth 2 g) 0 0))))))
+  (append (org-dayflow--date+ (org-dayflow--date-start)
+                              (org-dayflow--units-delta unit))
+          '(0 0)))
 
 (defun org-dayflow--format-datetime-short (dt)
   "Format DT (month day year ...) as \"YYYY-MM-DD Day\"."
@@ -1158,7 +1148,8 @@ QUERY may also be the symbol `unit-at-point', resolved at apply time."
          '((and (deadline) (not (done)))))))
 
 (defun org-dayflow--read-filter-char (type)
-  "Prompt for a filter command: +, -, TAB to select filter type, \\ to clear, . to filter at point, q to quit."
+  "Read a filter key for TYPE: + or - include or exclude, TAB select,
+\\ clear, . filter at point, q quit."
   (let ((prompt (format "Filter[%s] %s: [TAB]select [.]point [\\]off [q]uit"
                         (if org-dayflow--filter-exclude "-" "+") type)))
     (read-char-exclusive prompt)))
@@ -1206,14 +1197,22 @@ name instead and filtered nothing at all."
                 (when new-query (throw 'quit nil)))
                (t (message "Invalid key: %s" (single-key-description char)))))))))
     (when new-query
-      (setq org-dayflow--current-query
-            (org-dayflow--build-query org-dayflow--current-query new-query))
-      (unless (member org-dayflow--current-query org-dayflow--query-session)
-        (push org-dayflow--current-query org-dayflow--query-session))
-      (org-dayflow-refresh))))
+      (org-dayflow--add-query new-query))))
+
+(defun org-dayflow--use-query (query)
+  "Show QUERY, remember it for this session, and redraw."
+  (setq org-dayflow--current-query query)
+  (unless (member query org-dayflow--query-session)
+    (push query org-dayflow--query-session))
+  (org-dayflow-refresh))
+
+(defun org-dayflow--add-query (query)
+  "Narrow the current query by QUERY, as `org-dayflow--use-query' does."
+  (org-dayflow--use-query
+   (org-dayflow--build-query org-dayflow--current-query query)))
 
 (defun org-dayflow--collect-todo-keywords ()
-  "Return a flat list of all TODO keywords from `org-todo-keywords`, stripping parens."
+  "Return every keyword in `org-todo-keywords', without its key in parens."
   (let (result)
     (dolist (seq org-todo-keywords (nreverse result))
       (dolist (kw (cdr seq))
@@ -1234,8 +1233,8 @@ name instead and filtered nothing at all."
 
 (defun org-dayflow--collect-property-candidates (prop)
   "Return allowed values for PROP, considering global and buffer-local settings."
-  (let ((marker (get-text-property (point) 'org-marker)))
-    (when (and marker (marker-buffer marker))
+  (let ((marker (org-dayflow--marker-at-point)))
+    (when marker
       (with-current-buffer (marker-buffer marker)
         (org-with-wide-buffer
          (goto-char (point-min))
@@ -1268,7 +1267,7 @@ name instead and filtered nothing at all."
   "Call FUNC (like `org-schedule`) on the task at point in org-dayflow buffer.
 Display MESSAGE along with the timestamp."
   (interactive)
-  (let ((marker (get-text-property (point) 'org-marker)))
+  (let ((marker (org-dayflow--marker-at-point)))
     (unless marker (user-error "No task at point"))
     ;; The agenda, for `org-with-remote-undo' and the two variables its
     ;; expansion reads.  Here rather than at the top of the file: this is the
@@ -1283,7 +1282,7 @@ Display MESSAGE along with the timestamp."
           (message "%s" result))))))
 
 (defun org-dayflow--task-type (task)
-  "Return the type symbol of TASK: 'deadline, 'scheduled, or 'active."
+  "Return the type symbol of TASK: `deadline', `scheduled', or `active'."
   (cond
    ((plist-get task :deadline) 'deadline)
    ((plist-get task :scheduled) 'scheduled)
@@ -1433,6 +1432,17 @@ load is not spread over every day a long task is open."
          (cons (org-dayflow--datetime-min starts)
                (org-dayflow--datetime-max ends)))))
 
+(defun org-dayflow--range-cells (view-start start-dt end-dt)
+  "Return (FIRST . LAST), the cells [START-DT, END-DT) touches from VIEW-START.
+END-DT is exclusive, so LAST is the cell of the minute before it; a
+range with no length touches the one cell it starts in."
+  (let ((first (org-dayflow--title-unit view-start start-dt)))
+    (cons first
+          (max first
+               (org-dayflow--title-unit
+                view-start (org-dayflow--minutes-to-datetime
+                            (1- (org-dayflow--datetime-to-minutes end-dt))))))))
+
 (defun org-dayflow--title-position (task start units)
   "Return the cell where TASK's title starts, or nil if TASK misses the view.
 
@@ -1443,11 +1453,8 @@ last month to next, one scheduled this week and due the next month,
 one overdue and still open."
   (let ((range (org-dayflow--task-range task)))
     (when range
-      (let ((first (org-dayflow--title-unit start (car range)))
-            ;; END is exclusive: its cell is that of the minute before.
-            (last (org-dayflow--title-unit
-                   start (org-dayflow--minutes-to-datetime
-                          (1- (org-dayflow--datetime-to-minutes (cdr range)))))))
+      (pcase-let ((`(,first . ,last)
+                   (org-dayflow--range-cells start (car range) (cdr range))))
         (when (and (< first units) (>= last 0))
           (max 0 first))))))
 
@@ -1455,24 +1462,6 @@ one overdue and still open."
   "Face for TASK's category per `org-dayflow-category-faces', or nil."
   (let ((cat (plist-get task :category)))
     (and cat (cdr (assoc cat org-dayflow-category-faces)))))
-
-(defun org-dayflow--insert-title (task offset unit-char-width)
-  "Insert the task title at the given unit OFFSET.
-
-Padding spaces left of the title have no face, so strike-through
-on done titles does not extend into empty columns.  `org-marker'
-is applied to the whole line (including padding) so next/previous
-item navigation still finds the row from column 0."
-  (cl-destructuring-bind (&key title marker &allow-other-keys) task
-    (let* ((bol (point))
-           (prefix (make-string (* offset unit-char-width) ?\s))
-           (face (org-dayflow--title-face task)))
-      (insert prefix)
-      (let ((label-start (point)))
-        (insert "*" title)
-        (add-text-properties label-start (point) (list 'face face)))
-      (put-text-property bol (point) 'org-marker marker)
-      (insert "\n"))))
 
 (defun org-dayflow--title-face (task)
   "Face for TASK's title: done, else its category's, else its level's."
@@ -1516,12 +1505,7 @@ Return nil, inserting nothing, when the subtree misses the view."
   (let ((s (org-dayflow--node-start node))
         (e (org-dayflow--node-end node)))
     (when (and s e)
-      (let* ((first (org-dayflow--title-unit start s))
-             ;; END is exclusive: its cell is that of the minute before.
-             (last (max first
-                        (org-dayflow--title-unit
-                         start (org-dayflow--minutes-to-datetime
-                                (1- (org-dayflow--datetime-to-minutes e)))))))
+      (pcase-let ((`(,first . ,last) (org-dayflow--range-cells start s e)))
         (when (and (< first units) (>= last 0))
           (let* ((task (org-dayflow--node-task node))
                  (face (org-dayflow--title-face task))
@@ -1554,127 +1538,56 @@ Return nil, inserting nothing, when the subtree misses the view."
             (insert "\n")
             t))))))
 
-(defun org-dayflow--repeat-groups (nodes)
-  "Return a table from each task row under NODES to its repeats.
-A task row is a node without children that is not folded away; its
-repeats are the task rows with the same title and no TODO keyword,
-wherever they are in the outline.  Each maps to the list of all of
-them, itself included, in outline order.  Nil when
-`org-dayflow-merge-repeats' is off."
-  (when org-dayflow-merge-repeats
-    (let ((by-title (make-hash-table :test #'equal))
-          (groups (make-hash-table :test #'eq)))
-      (cl-labels ((walk (nodes depth)
-                    (dolist (node nodes)
-                      (let ((kids (org-dayflow--node-children node))
-                            (task (org-dayflow--node-task node)))
-                        (cond
-                         ((and (not kids) (not (plist-get task :todo)))
-                          (push node (gethash (plist-get task :title)
-                                              by-title)))
-                         ((org-dayflow--node-open-p node depth)
-                          (walk kids (1+ depth))))))))
-        (walk nodes 0))
-      (maphash (lambda (_title group)
-                 (setq group (nreverse group))
-                 (dolist (node group) (puthash node group groups)))
-               by-title)
-      groups)))
+(defun org-dayflow--insert-task (node start units unit-char-width)
+  "Insert NODE's row: its title where its range enters the view.
+The working window is boxed and the occupation filled on the line.
+Padding left of the title has no face, so a done title's
+strike-through does not run into empty columns; `org-marker' covers
+the whole line, so the row is found from any column.  Insert nothing
+when the range misses the view."
+  (let* ((task (org-dayflow--node-task node))
+         (offset (org-dayflow--title-position task start units)))
+    (when offset
+      (let ((bol (point)))
+        (insert (make-string (* offset unit-char-width) ?\s))
+        (insert (propertize (concat "*" (plist-get task :title))
+                            'face (org-dayflow--title-face task)))
+        (add-text-properties bol (point)
+                             (list 'org-marker (plist-get task :marker)
+                                   'org-dayflow-node node))
+        (insert "\n"))
+      ;; Painted on the line just inserted.
+      (org-dayflow--draw-occupation-background
+       (org-dayflow--occupation-region task start units unit-char-width))
+      (org-dayflow--draw-working-box
+       (org-dayflow--working-region task start units unit-char-width)))))
 
-(defun org-dayflow--insert-occurrences (nodes start units unit-char-width)
-  "Insert one row for NODES, the occurrences of one event.
-The title is written once, at the earliest occurrence in view, and
-each occurrence in view has its range painted on the line.  The
-cells an occurrence covers carry its own marker and node, so what
-is under point is the occurrence in that column.  Insert nothing
-when none of them is in view."
-  (let ((shown (sort (cl-loop for node in nodes
-                              for offset = (org-dayflow--title-position
-                                            (org-dayflow--node-task node)
-                                            start units)
-                              when offset collect (cons offset node))
-                     #'car-less-than-car)))
-    (when shown
-      (let ((first (cdar shown)))
-        (org-dayflow--insert-title (org-dayflow--node-task first)
-                                   (caar shown) unit-char-width)
-        (put-text-property (line-beginning-position 0) (line-end-position 0)
-                           'org-dayflow-node first))
-      ;; No row, nothing to paint: the regions are drawn on the line
-      ;; just inserted, and without one they land on someone else's.
-      (pcase-dolist (`(,offset . ,node) shown)
-        (let* ((task (org-dayflow--node-task node))
-               (occupation (org-dayflow--occupation-region
-                            task start units unit-char-width))
-               (working (org-dayflow--working-region
-                         task start units unit-char-width)))
-          (org-dayflow--draw-occupation-background occupation)
-          (org-dayflow--draw-working-box working)
-          (when (cdr shown)
-            (let ((props (list 'org-marker (plist-get task :marker)
-                               'org-dayflow-node node)))
-              (dolist (region (list occupation working
-                                    (org-dayflow--cell-region
-                                     offset unit-char-width)))
-                (when region
-                  (add-text-properties (car region) (cdr region) props))))))))))
-
-(defun org-dayflow--cell-region (offset unit-char-width)
-  "Return (START . END) of cell OFFSET on the line before point."
-  (save-excursion
-    (forward-line -1)
-    (move-to-column (* offset unit-char-width) t)
-    (let ((left (point)))
-      (move-to-column (* (1+ offset) unit-char-width) t)
-      (cons left (point)))))
-
-(defun org-dayflow--insert-nodes (nodes depth start units unit-char-width
-                                         &optional repeats)
+(defun org-dayflow--insert-nodes (nodes depth start units unit-char-width)
   "Insert a row for each of NODES, DEPTH levels down, and the open ones' children.
-A row with rows under it is a summary line; a row without is a task
-drawn as before, at its own date and only when that date is in view.
-REPEATS is a table from `org-dayflow--repeat-groups': repeats of one
-event share the row of the first of them that is reached, and are
-marked `drawn' in it once they have one.  The first reached rather
-than the first in the outline: that one may sit under a heading
-whose line misses the view, which is never opened, and its repeats
-would go with it."
+A row with rows under it is a summary line; a row without is a task,
+drawn when its range is in view."
   (dolist (node nodes)
-    (let ((kids (org-dayflow--node-children node))
-          (group (and repeats (gethash node repeats))))
-      (cond
-       (kids
+    (let ((kids (org-dayflow--node-children node)))
+      (if (not kids)
+          (org-dayflow--insert-task node start units unit-char-width)
         (let ((open (org-dayflow--node-open-p node depth)))
           (when (and (org-dayflow--insert-summary
                       node open start units unit-char-width)
                      open)
             (org-dayflow--insert-nodes kids (1+ depth)
-                                       start units unit-char-width repeats))))
-       ((not (eq group 'drawn))
-        (let ((group (or group (list node))))
-          (org-dayflow--insert-occurrences group start units
-                                           unit-char-width)
-          (when repeats
-            (dolist (n group) (puthash n 'drawn repeats)))))))))
+                                       start units unit-char-width)))))))
 
 (defun org-dayflow--range-region (start-dt end-dt view-start units unit-char-width)
   "Return (BAR-POS-START . BAR-POS-END) of the character span covering
 the datetime range [START-DT, END-DT) on the current title line, or
 nil if outside view.
 
-Any cell that the range touches at all is included.  When
-START-DT equals END-DT (single-point), one cell is filled."
+Any cell that the range touches at all is included, as is in
+`org-dayflow--range-cells'."
   (when (and start-dt end-dt)
-    (let* ((start-cell (org-dayflow--title-unit view-start start-dt))
-           (end-cell
-            (if (equal start-dt end-dt)
-                (1+ start-cell)
-              (1+ (org-dayflow--title-unit
-                   view-start
-                   (org-dayflow--minutes-to-datetime
-                    (1- (org-dayflow--datetime-to-minutes end-dt)))))))
-           (bar-start (max 0 start-cell))
-           (bar-end   (min units end-cell)))
+    (let* ((cells (org-dayflow--range-cells view-start start-dt end-dt))
+           (bar-start (max 0 (car cells)))
+           (bar-end   (min units (1+ (cdr cells)))))
       (when (> bar-end bar-start)
         (save-excursion
           (forward-line -1)
@@ -1812,17 +1725,11 @@ overlays without ever modifying the read-only buffer."
   "Return a compact context string for `header-line-format'."
   (let* ((cell (org-dayflow--cursor-cell))
          (unit-dt (and cell (org-dayflow--unit-index-to-datetime cell)))
-         (marker (get-text-property (point) 'org-marker))
-         (task-dt
-          (when (and marker (marker-buffer marker))
-            (with-current-buffer (marker-buffer marker)
-              (save-excursion
-                (goto-char marker)
-                (or (org-dayflow--datetime-timestamp
-                     (org-entry-get nil "DEADLINE"))
-                    (car (org-dayflow--earliest-active-datetime-range))
-                    (org-dayflow--datetime-timestamp
-                     (org-entry-get nil "SCHEDULED")))))))
+         ;; From the row's own node: this runs on every redisplay, and
+         ;; reading the Org buffer here meant visiting it each time.
+         (node (org-dayflow--node-at-point))
+         (task-dt (and node (org-dayflow--task-anchor-datetime
+                             (org-dayflow--node-task node))))
          (parts (delq nil
                       (list
                        (when unit-dt
@@ -1915,8 +1822,7 @@ characters."
         ;; A marker: padding the lines above to full width comes later, and
         ;; would leave a position on the blank line before the first row.
         (setq body-start (point-marker))
-        (org-dayflow--insert-nodes tree 0 start units unit-char-width
-                                   (org-dayflow--repeat-groups tree))
+        (org-dayflow--insert-nodes tree 0 start units unit-char-width)
         (org-dayflow--pad-grid-to-full-width grid-start units unit-char-width)
         ;; Bands first (lowest visual priority), then now-column on top.
         (org-dayflow--draw-column-bands grid-start start units unit-char-width)
@@ -1972,14 +1878,9 @@ characters."
   (dotimes (_ n)
     (forward-line 1)
     (while (and (not (eobp))
-                (not (get-text-property (point) 'org-marker)))
+                (not (org-dayflow--marker-at-point)))
       (forward-line 1)))
-  (org-dayflow--move-to-title)
-  (org-dayflow-echo-info)
-  (when org-dayflow--follow-mode
-    (let ((marker (get-text-property (point) 'org-marker)))
-      (org-dayflow--follow)
-      (org-dayflow--highlight-current-heading marker))))
+  (org-dayflow--arrive))
 
 (defun org-dayflow-previous-item (n)
   "Move to the previous N-th item in the org-dayflow buffer.
@@ -1991,22 +1892,14 @@ At the first task, says so rather than moving anywhere."
       (let ((before (point)))
         (forward-line -1)
         (while (and (not (bobp))
-                    (not (get-text-property (point) 'org-marker)))
+                    (not (org-dayflow--marker-at-point)))
           (forward-line -1))
-        (if (get-text-property (point) 'org-marker)
+        (if (org-dayflow--marker-at-point)
             (setq moved t)
           (goto-char before))))
-    (cond
-     (moved
-      (org-dayflow--move-to-title)
-      (org-dayflow-echo-info)
-      (when org-dayflow--follow-mode
-        (let ((marker (get-text-property (point) 'org-marker)))
-          (org-dayflow--follow)
-          (org-dayflow--highlight-current-heading marker))))
-     (t
-      (org-dayflow-echo-info)
-      (message "Beginning of dayflow")))))
+    (if moved
+        (org-dayflow--arrive)
+      (message "Beginning of dayflow"))))
 
 (defun org-dayflow-scroll-left (n)
   "Scroll the current window left by N characters."
@@ -2036,43 +1929,33 @@ At the first task, says so rather than moving anywhere."
   (org-dayflow--span-set org-dayflow--current-span)
   (org-dayflow-refresh))
 
+(defun org-dayflow--visit (display)
+  "Show the Org heading at point with DISPLAY, a function of a buffer."
+  (let ((marker (org-dayflow--marker-at-point)))
+    (if (not marker)
+        (message "No task at point.")
+      (funcall display (marker-buffer marker))
+      (goto-char marker)
+      (org-fold-show-entry))))
+
 (defun org-dayflow-switch-to ()
   "Jump to the Org heading at point."
   (interactive)
-  (let ((marker (get-text-property (point) 'org-marker)))
-    (if (and marker (marker-buffer marker))
-        (progn
-          (switch-to-buffer (marker-buffer marker))
-          (goto-char marker)
-          (org-fold-show-entry))
-      (message "No task at point."))))
+  (org-dayflow--visit #'switch-to-buffer))
 
 (defun org-dayflow-goto ()
   "Jump to the Org heading at point and open in other window."
   (interactive)
-  (let ((marker (get-text-property (point) 'org-marker)))
-    (if (and marker (marker-buffer marker))
-        (progn
-          (pop-to-buffer (marker-buffer marker))
-          (goto-char marker)
-          (org-fold-show-entry))
-      (message "No task at point."))))
+  (org-dayflow--visit #'pop-to-buffer))
 
 (defun org-dayflow-show ()
-  "Show the Org heading at point in another window, staying here.
-On a row of repeats, the occurrence under point; elsewhere on the
-row, the row's own heading."
+  "Show the Org heading at point in another window, staying here."
   (interactive)
-  (let ((pos (if (get-text-property (point) 'org-marker)
-                 (point)
-               (line-beginning-position))))
-    (let ((marker (get-text-property pos 'org-marker)))
-      (if (not (and marker (marker-buffer marker)))
-          (message "No task at point.")
-        (save-excursion
-          (goto-char pos)
-          (org-dayflow--follow))
-        (org-dayflow--highlight-current-heading marker)))))
+  (let ((marker (org-dayflow--marker-at-point)))
+    (if (not marker)
+        (message "No task at point.")
+      (org-dayflow--follow)
+      (org-dayflow--highlight-current-heading marker))))
 
 (defun org-dayflow--goto-key (key)
   "Move to the row of the heading named KEY, or of its nearest shown ancestor.
@@ -2138,7 +2021,7 @@ Use `q' which is bound to `org-dayflow-quit' for full window-restore support."
   (message "Follow mode %s" (if org-dayflow--follow-mode "enabled" "disabled")))
 
 (defun org-dayflow-echo-info ()
-  "Echo the Org path, todo state, tags, properties, and scheduling info of the current item.
+  "Echo the path, state, tags, properties and dates of the item at point.
 Also prefixes the timeline column date under point when available."
   (interactive)
   (let* ((cell (org-dayflow--cursor-cell))
@@ -2146,8 +2029,8 @@ Also prefixes the timeline column date under point when available."
          (col-str (when col-dt
                     (format "COL:%s  "
                             (org-dayflow--format-datetime-short col-dt))))
-         (marker (get-text-property (point) 'org-marker)))
-    (if (not (and marker (marker-buffer marker)))
+         (marker (org-dayflow--marker-at-point)))
+    (if (not marker)
         (when col-str (message "%s" (string-trim-right col-str)))
       (with-current-buffer (marker-buffer marker)
         (save-excursion
@@ -2197,15 +2080,11 @@ Also prefixes the timeline column date under point when available."
 (defun org-dayflow-filter (query)
   "Add a FILTER to the current Dayflow query interactively."
   (interactive "sAdd query (lisp, e.g., (tags \"work\")): ")
-  (let ((new-query (read query)))
-    (setq org-dayflow--current-query
-          (org-dayflow--build-query org-dayflow--current-query new-query))
-    (unless (member org-dayflow--current-query org-dayflow--query-session)
-      (push org-dayflow--current-query org-dayflow--query-session))
-    (org-dayflow-refresh)))
+  (org-dayflow--add-query (read query)))
 
 (defun org-dayflow-filter-by-tag (&optional immediate)
-  "Filter org-dayflow by TAG. If IMMEDIATE is non-nil, enter completing-read immediately."
+  "Filter org-dayflow by TAG.
+If IMMEDIATE is non-nil, read the value at once."
   (interactive "P")
   (org-dayflow--filter-by
    "Tag"
@@ -2213,9 +2092,9 @@ Also prefixes the timeline column date under point when available."
    (lambda (tag) `(tags ,tag))
    immediate
    `((?. . ,(lambda ()
-              (let ((marker (get-text-property (point) 'org-marker)))
+              (let ((marker (org-dayflow--marker-at-point)))
                 (cond
-                 ((not (and marker (marker-buffer marker)))
+                 ((not marker)
                   (message "No task at point.")
                   nil)
                  (t
@@ -2229,7 +2108,8 @@ Also prefixes the timeline column date under point when available."
                               tags)))))))))))
 
 (defun org-dayflow-filter-by-todo (&optional immediate)
-  "Filter org-dayflow by TODO keywords. If IMMEDIATE is non-nil, enter completing-read immediately."
+  "Filter org-dayflow by TODO keywords.
+If IMMEDIATE is non-nil, read the value at once."
   (interactive "P")
   (org-dayflow--filter-by
    "Todo"
@@ -2238,7 +2118,8 @@ Also prefixes the timeline column date under point when available."
    immediate))
 
 (defun org-dayflow-filter-by-property (&optional immediate)
-  "Filter org-dayflow by PROPERTY. If IMMEDIATE is non-nil, enter completing-read immediately."
+  "Filter org-dayflow by PROPERTY.
+If IMMEDIATE is non-nil, read the value at once."
   (interactive "P")
   (org-dayflow--filter-by
    "Property"
@@ -2247,7 +2128,8 @@ Also prefixes the timeline column date under point when available."
    immediate))
 
 (defun org-dayflow-filter-by-category (&optional immediate)
-  "Filter org-dayflow by CATEGORY. If IMMEDIATE is non-nil, enter completing-read immediately."
+  "Filter org-dayflow by CATEGORY.
+If IMMEDIATE is non-nil, read the value at once."
   (interactive "P")
   (org-dayflow--filter-by
    "Category"
@@ -2256,7 +2138,8 @@ Also prefixes the timeline column date under point when available."
    immediate))
 
 (defun org-dayflow-filter-by-regexp (&optional immediate)
-  "Filter org-dayflow by REGEXP. If IMMEDIATE is non-nil, enter completing-read immediately."
+  "Filter org-dayflow by REGEXP.
+If IMMEDIATE is non-nil, read the value at once."
   (interactive "P")
   (org-dayflow--filter-by
    "Regexp"
@@ -2312,18 +2195,14 @@ entries still offer apply / save / delete."
          (payload (cdr entry)))
     (if (memq kind '(preset session))
         (let ((query (org-dayflow--resolve-query-choice kind payload)))
-          (setq org-dayflow--current-query query)
-          (unless (member query org-dayflow--query-session)
-            (push query org-dayflow--query-session))
-          (org-dayflow-refresh)
+          (org-dayflow--use-query query)
           (message "Query: %s" (prin1-to-string query)))
       ;; saved: keep apply / delete / save actions
       (let ((action (read-key "Action: RET=apply  d=delete  s=save")))
         (pcase action
           (?\r
-           (let ((query (org-dayflow--resolve-query-choice kind payload)))
-             (setq org-dayflow--current-query query)
-             (org-dayflow-refresh)))
+           (org-dayflow--use-query
+            (org-dayflow--resolve-query-choice kind payload)))
           (?s
            (let ((query (cdr payload))
                  (label (car payload)))
