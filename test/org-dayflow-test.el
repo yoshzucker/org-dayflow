@@ -211,8 +211,20 @@ was last spring."
     (org-dayflow--span-set span)
     (setq org-dayflow--current-query nil)
     (org-dayflow--render)
-    (cl-count-if (lambda (l) (string-match-p "^ *\\*[^ ]" l))
-                 (split-string (buffer-string) "\n"))))
+    (length (org-dayflow-test--row-titles))))
+
+(defun org-dayflow-test--row-titles ()
+  "Return the rows of the current Dayflow buffer as trimmed strings."
+  (let (rows)
+    (save-excursion
+      (goto-char (point-min))
+      (while (not (eobp))
+        (when (get-text-property (line-beginning-position) 'org-marker)
+          (push (string-trim (buffer-substring-no-properties
+                              (line-beginning-position) (line-end-position)))
+                rows))
+        (forward-line 1)))
+    (nreverse rows)))
 
 (ert-deftest org-dayflow-test-a-longer-period-shows-more ()
   "The demo reaches past the week it opens on.
@@ -249,6 +261,120 @@ so a demo left on the screen is a week nobody could tell from their own."
       (should (= 0 (cl-count-if
                     (lambda (b) (string-prefix-p "*Org Dayflow(" (buffer-name b)))
                     (buffer-list)))))))
+
+;;;; Parents drawn across their children
+
+(defun org-dayflow-test--day (offset)
+  "Return \"YYYY-MM-DD Day\" OFFSET days from today."
+  (format-time-string "%Y-%m-%d %a" (time-add nil (days-to-time offset))))
+
+(defmacro org-dayflow-test--with-outline (text &rest body)
+  "Run BODY in a month view over an agenda file holding TEXT.
+`%N' in TEXT is replaced by the date N days from today."
+  (declare (indent 1))
+  `(let* ((file (make-temp-file "dfoutline" nil ".org"))
+          (org-agenda-files (list file))
+          (org-todo-keywords '((sequence "NEXT" "|" "DONE"))))
+     (unwind-protect
+         (progn
+           (with-temp-file file
+             (insert (replace-regexp-in-string
+                      "%\\(-?[0-9]+\\)"
+                      (lambda (m)
+                        (org-dayflow-test--day
+                         (string-to-number (substring m 1))))
+                      ,text t t)))
+           (with-temp-buffer
+             (org-dayflow-mode)
+             (org-dayflow--span-set 'month)
+             (cl-letf (((symbol-function 'org-dayflow--view-width)
+                        (lambda () 100)))
+               (org-dayflow--render)
+               ,@body)))
+       (when-let ((buf (get-file-buffer file)))
+         (with-current-buffer buf (set-buffer-modified-p nil))
+         (kill-buffer buf))
+       (delete-file file))))
+
+(defconst org-dayflow-test--meeting
+  "* 執行会議付議
+** DONE 論点を洗い出す
+SCHEDULED: <%-3>
+** NEXT 資料の骨子
+SCHEDULED: <%1>
+** NEXT 修正版の提出
+SCHEDULED: <%5> DEADLINE: <%8>
+* 生活
+** 散歩
+"
+  "A piece of work written the usual way: dates on the steps, none on the
+heading, and a deadline on the last step only.  Then a heading with
+nothing dated under it.")
+
+(ert-deftest org-dayflow-test-a-heading-comes-with-its-match ()
+  "The heading carries no date and so matches nothing, but a step does,
+and a step drawn without the work it belongs to is a row nobody can place.
+A heading with nothing matching under it stays out."
+  (org-dayflow-test--with-outline org-dayflow-test--meeting
+    (let ((rows (org-dayflow-test--row-titles)))
+      (should (string-prefix-p "▾執行会議付議" (car rows)))
+      (should (member "*資料の骨子" rows))
+      (should-not (cl-some (lambda (r) (string-match-p "生活\\|散歩" r)) rows)))))
+
+(ert-deftest org-dayflow-test-a-parent-spans-what-is-done-too ()
+  "The default query leaves done steps out, but the heading's line starts
+where the work did: otherwise it would shrink each time a step was done,
+and a month would show work starting today that started last week."
+  (org-dayflow-test--with-outline org-dayflow-test--meeting
+    (should-not (member "*論点を洗い出す" (org-dayflow-test--row-titles)))
+    (let* ((node (org-dayflow--node-at-point))
+           (start (org-dayflow--node-start node)))
+      (should (equal "執行会議付議"
+                     (plist-get (org-dayflow--node-task node) :title)))
+      (should (equal (format-time-string
+                      "%Y-%m-%d" (time-add nil (days-to-time -3)))
+                     (format "%04d-%02d-%02d"
+                             (nth 2 start) (nth 0 start) (nth 1 start)))))))
+
+(ert-deftest org-dayflow-test-folded-the-deadline-stays ()
+  "Folding drops the steps and keeps what a month is read for: where the
+work runs, and the ◆ of the deadline written on its last step.  Open, the
+step shows its own date and the heading's line does not repeat it."
+  (org-dayflow-test--with-outline org-dayflow-test--meeting
+    (should-not (string-match-p "◆" (car (org-dayflow-test--row-titles))))
+    (org-dayflow-toggle-fold)
+    (let ((rows (org-dayflow-test--row-titles)))
+      (should (equal 1 (length rows)))
+      (should (string-match-p "\\`▸執行会議付議 ─*◆" (car rows))))
+    ;; and the cursor is still on the row it folded
+    (should (string-match-p "執行会議付議"
+                            (buffer-substring (line-beginning-position)
+                                              (line-end-position))))
+    (org-dayflow-toggle-fold)
+    (should (member "*資料の骨子" (org-dayflow-test--row-titles)))))
+
+(ert-deftest org-dayflow-test-depth-one-is-the-headings ()
+  "S-TAB from the default two levels shows the whole outline here -- it is
+only two deep -- and then starts again at the top level alone."
+  (org-dayflow-test--with-outline org-dayflow-test--meeting
+    (org-dayflow-cycle-depth)
+    (should (= 1 org-dayflow--visible-depth))
+    (should (equal 1 (length (org-dayflow-test--row-titles))))
+    (org-dayflow-cycle-depth)
+    (should (= 2 org-dayflow--visible-depth))
+    (should (= 3 (length (org-dayflow-test--row-titles))))))
+
+(ert-deftest org-dayflow-test-the-load-is-the-steps ()
+  "A heading is its steps added up, so counting it in the sparkline as well
+would count the same work twice."
+  (org-dayflow-test--with-outline org-dayflow-test--meeting
+    (let ((spark (save-excursion
+                   (goto-char org-dayflow--grid-start)
+                   (buffer-substring-no-properties
+                    (point) (line-end-position)))))
+      (should (= 2 (cl-count-if (lambda (c) (memq c (string-to-list
+                                                     org-dayflow-spark-chars)))
+                                spark))))))
 
 (provide 'org-dayflow-test)
 
