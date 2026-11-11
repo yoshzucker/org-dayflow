@@ -403,6 +403,10 @@ tasks they are made of."
   "Rows folded or opened by hand: node key -> `open' or `folded'.
 Overrides `org-dayflow--visible-depth' for that row.")
 
+(defvar-local org-dayflow--tree-cache nil
+  "(KEY . TREE): the outline last read, and what it was read from.
+See `org-dayflow--tree-key'.")
+
 (defvar-local org-dayflow--tree-depth 0
   "Levels in the outline last rendered, for `org-dayflow-cycle-depth'.")
 
@@ -982,18 +986,44 @@ spans is decided by all of its children."
     (cl-remove-if (lambda (file) (member (file-truename file) excluded))
                   (org-agenda-files))))
 
-(defun org-dayflow--select-tree (query)
-  "Return the outline of `org-dayflow--files' as far as QUERY shows it.
+(defun org-dayflow--read-tree (query files)
+  "Return the outline of FILES as far as QUERY shows it.
 A heading is kept when it or something under it matches, so a match
 arrives with the headings it belongs to."
   (let (roots)
-    (dolist (file (org-dayflow--files))
+    (dolist (file files)
       (when (file-exists-p file)
         (with-current-buffer (find-file-noselect file)
           ;; Ensure Org's keyword and tag caches are populated for this buffer.
           (org-set-regexps-and-options nil)
           (setq roots (append roots (org-dayflow--file-nodes query))))))
     (org-dayflow--prune roots)))
+
+(defun org-dayflow--tree-key (query files)
+  "Return what the outline of FILES under QUERY is read from.
+Each file's buffer and its modification count, so an edit, a revert or
+a killed buffer reads it again, and today, which an overdue task runs
+on to."
+  (list query (calendar-current-date)
+        (mapcar (lambda (file)
+                  (let ((buffer (get-file-buffer file)))
+                    (cons file (and buffer (buffer-chars-modified-tick buffer)))))
+                files)))
+
+(defun org-dayflow--select-tree (query)
+  "Return the outline of `org-dayflow--files' as far as QUERY shows it.
+The outline is read again only when `org-dayflow--tree-key' has
+changed, so folding a row or changing the period redraws what was
+already read."
+  (let* ((files (org-dayflow--files))
+         (key (org-dayflow--tree-key query files)))
+    (if (equal key (car org-dayflow--tree-cache))
+        (cdr org-dayflow--tree-cache)
+      (let ((tree (org-dayflow--read-tree query files)))
+        ;; Reading visits the files, so the key is taken after it.
+        (setq org-dayflow--tree-cache
+              (cons (org-dayflow--tree-key query files) tree))
+        tree))))
 
 (defun org-dayflow--leaf-tasks (nodes)
   "Return the tasks of the rows under NODES that have no rows under them.
@@ -1518,13 +1548,19 @@ Return nil, inserting nothing, when the subtree misses the view."
             (insert (propertize (concat (if open "▾" "▸") (plist-get task :title))
                                 'face (list 'org-dayflow-summary-face face)))
             (setq label-end (current-column))
-            (when (< label-end end-col) (insert " "))
-            (while (< (current-column) end-col)
-              (let ((ms (assq (/ (current-column) unit-char-width) milestones)))
-                (if (not ms)
-                    (insert (propertize "─" 'face face))
-                  (insert (propertize "◆" 'face (cdr ms)))
-                  (setq milestones (delq ms milestones)))))
+            ;; The column is counted along rather than asked for: asking
+            ;; walks the line from its start, once for each mark on it.
+            (let ((col label-end))
+              (when (< col end-col)
+                (insert " ")
+                (setq col (1+ col)))
+              (while (< col end-col)
+                (let ((ms (assq (/ col unit-char-width) milestones)))
+                  (if (not ms)
+                      (insert (propertize "─" 'face face))
+                    (insert (propertize "◆" 'face (cdr ms)))
+                    (setq milestones (delq ms milestones)))
+                  (setq col (+ col (char-width (char-before)))))))
             (pcase-dolist (`(,cell . ,ms-face) milestones)
               (let ((left (org-dayflow--pos-at-column (* cell unit-char-width)))
                     (right (org-dayflow--pos-at-column
@@ -1621,20 +1657,22 @@ Any cell that the range touches at all is included, as is in
     (add-face-text-property (car region) (cdr region)
                             'org-dayflow-title-occupation-face)))
 
-(defun org-dayflow--paint-column-face (grid-start unit units unit-char-width face)
-  "Apply FACE to UNIT's cell on every grid row from GRID-START (APPEND).
-No-op when UNIT is outside [0, UNITS)."
-  (when (and (<= 0 unit) (< unit units))
-    (let ((left-col  (* unit unit-char-width))
-          (right-col (* (1+ unit) unit-char-width)))
+(defun org-dayflow--paint-column-face (grid-start cells units unit-char-width face)
+  "Apply FACE to each of CELLS on every grid row from GRID-START (APPEND).
+CELLS is a unit or a list of them; those outside [0, UNITS) are skipped.
+Every row is visited once for all of CELLS, not once for each."
+  (let ((cells (cl-remove-if-not (lambda (unit) (and (<= 0 unit) (< unit units)))
+                                 (if (listp cells) cells (list cells)))))
+    (when cells
       (save-excursion
         (goto-char grid-start)
         (while (not (eobp))
-          (beginning-of-line)
-          (move-to-column left-col t)
-          (let ((start-pos (point)))
-            (move-to-column right-col t)
-            (add-face-text-property start-pos (point) face t))
+          (dolist (unit cells)
+            (beginning-of-line)
+            (move-to-column (* unit unit-char-width) t)
+            (let ((start-pos (point)))
+              (move-to-column (* (1+ unit) unit-char-width) t)
+              (add-face-text-property start-pos (point) face t)))
           (forward-line 1))))))
 
 (defun org-dayflow--draw-column-bands (grid-start view-start units unit-char-width)
@@ -1643,14 +1681,16 @@ Uses a single face (`org-dayflow-weekend-column-face') so the cue stays
 simple: denser shade = Saturday/Sunday."
   (when (and org-dayflow-column-bands
              (eq (org-dayflow--span-unit) 'day))
-    (let ((start-abs (calendar-absolute-from-gregorian view-start)))
+    (let ((start-abs (calendar-absolute-from-gregorian view-start))
+          weekend)
       (dotimes (unit units)
         (let* ((date (calendar-gregorian-from-absolute (+ start-abs unit)))
                (dow (calendar-day-of-week date)))
           (when (or (= dow 0) (= dow 6))
-            (org-dayflow--paint-column-face
-             grid-start unit units unit-char-width
-             'org-dayflow-weekend-column-face)))))))
+            (push unit weekend))))
+      (org-dayflow--paint-column-face
+       grid-start (nreverse weekend) units unit-char-width
+       'org-dayflow-weekend-column-face))))
 
 (defun org-dayflow--draw-now-column (grid-start view-start units unit-char-width)
   "Paint the now-column face across every grid row from GRID-START.
@@ -1807,9 +1847,13 @@ characters."
 
 ;;; User commands
 (defun org-dayflow-refresh ()
-  "Refresh the current org-dayflow buffer."
+  "Refresh the current org-dayflow buffer.
+Called as a command, read the files again even when nothing in them
+has changed, for what the outline depends on outside them."
   (interactive)
   (when (derived-mode-p 'org-dayflow-mode)
+    (when (called-interactively-p 'interactive)
+      (setq org-dayflow--tree-cache nil))
     (org-dayflow--render)))
 
 (defun org-dayflow--span-names ()

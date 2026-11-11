@@ -379,6 +379,28 @@ step shows its own date and the heading's line does not repeat it."
     (org-dayflow-toggle-fold)
     (should (member "*資料の骨子" (org-dayflow-test--row-titles)))))
 
+(ert-deftest org-dayflow-test-folding-reads-nothing-again ()
+  "Folding a row redraws the outline already read: reading every file
+again for it was most of the wait on each TAB.  An edit to a file is
+read on the next redraw all the same."
+  (org-dayflow-test--with-outline org-dayflow-test--meeting
+    (let ((reads 0)
+          (read-tree (symbol-function 'org-dayflow--read-tree)))
+      (cl-letf (((symbol-function 'org-dayflow--read-tree)
+                 (lambda (&rest args)
+                   (setq reads (1+ reads))
+                   (apply read-tree args))))
+        (org-dayflow-toggle-fold)
+        (org-dayflow-cycle-depth)
+        (should (= 0 reads))
+        (with-current-buffer (get-file-buffer file)
+          (goto-char (point-max))
+          (insert (format "* NEXT 新しい仕事\nSCHEDULED: <%s>\n"
+                          (org-dayflow-test--day 2))))
+        (org-dayflow-refresh)
+        (should (= 1 reads))
+        (should (member "*新しい仕事" (org-dayflow-test--row-titles)))))))
+
 (ert-deftest org-dayflow-test-depth-one-is-the-headings ()
   "S-TAB from two levels shows the whole outline here -- it is
 only two deep -- and then starts again at the top level alone."
