@@ -117,13 +117,12 @@ keeping -- what happened yesterday is why today looks the way it does."
   :type '(alist :key-type symbol :value-type number)
   :group 'org-dayflow)
 
-(defcustom org-dayflow-initial-query
-  '((and (or (scheduled) (deadline) (regexp org-ts-regexp))
-         (not (done))))
+(defcustom org-dayflow-initial-query nil
   "Default S-expression query for org-dayflow when no filters are applied.
 The query language is a small subset evaluated with Org primitives.
-Default hides done-type states via `(not (done))'; pick a preset
-from query select (`/' then `s') to include DONE/CANCEL/DELEG."
+nil filters nothing, so every heading of the files is a row; pick a
+preset from query select (`/' then `s') to narrow it, for instance
+to open and dated tasks."
   :type 'sexp
   :group 'org-dayflow)
 
@@ -192,7 +191,7 @@ a generic hook; populate it in your own configuration, not in the package."
   :type 'boolean
   :group 'org-dayflow)
 
-(defcustom org-dayflow-visible-depth 2
+(defcustom org-dayflow-visible-depth 1
   "How many levels of the outline a new view shows.
 A row with rows under it is drawn across the dates of its whole
 subtree, so folding it keeps where its work falls and drops only
@@ -871,12 +870,13 @@ title is still on the row."
 (defun org-dayflow--build-query (base-query &optional append-query)
   "Combine BASE-QUERY with APPEND-QUERY into a well-formed query.
 
-- If BASE-QUERY is nil, use `org-dayflow-initial-query` as the base.
+- If BASE-QUERY is nil, use `org-dayflow-initial-query` as the base,
+  and if that is nil too, a query that matches every heading.
 - Ensures the resulting query is wrapped with a top-level `and` form.
 - If APPEND-QUERY is a list of queries, append each element.
 - If APPEND-QUERY is a single query form, wrap and append it.
 - If APPEND-QUERY is nil, return the well-formed BASE-QUERY as-is."
-  (let* ((raw (or base-query org-dayflow-initial-query))
+  (let* ((raw (or base-query org-dayflow-initial-query '(and)))
          (listed (if (and (listp raw) (listp (cadr raw)))
                      raw (list raw)))
          (wellformed (if (eq (car listed) 'and) listed (cons 'and listed))))
@@ -1131,7 +1131,7 @@ the unit's start day via `on-day'."
   "Alist of (LABEL . QUERY) built-in presets for query selection.
 QUERY may also be the symbol `unit-at-point', resolved at apply time."
   (list
-   (cons "[preset]: open + dated (default)"
+   (cons "[preset]: open + dated"
          '((and (or (scheduled) (deadline) (regexp org-ts-regexp))
                 (not (done)))))
    (cons "[preset]: all dated (include done)"

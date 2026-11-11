@@ -85,7 +85,7 @@ In the Dayflow buffer the most important keys are:
 
 Weekend columns get a subtle background, on the periods drawn a day to a column, when =org-dayflow-column-bands= is non-nil.
 
-Query presets (via =/ s=): open+dated (default), all dated including done, open only, done only, unit at point, scheduled, deadline.
+Query presets (via =/ s=): open+dated, all dated including done, open only, done only, unit at point, scheduled, deadline.
 Atoms include =(done)= and =(on-day MONTH DAY YEAR)=.
 
 ** Headings and their children
@@ -105,6 +105,9 @@ where it is due.
 
 : ▸執行会議付議 ────────────◆──
 
+- Nothing is filtered until a query is given: every heading whose dates, or
+  those under it, reach into the period is a row.  A heading with no date in
+  its subtree has nowhere on the timeline to be drawn.
 - A heading is shown when it or anything under it matches the query, so a
   matching task arrives with the work it belongs to.
 - The line is worked out from the whole subtree, matching or not, so it does
@@ -112,8 +115,9 @@ where it is due.
 - The sparkline counts the tasks, not the headings, so nothing is counted twice.
 - A task without rows under it is drawn as before, at its own date.
 
-=org-dayflow-visible-depth= (default 2) is how many levels a new view shows;
-=S-TAB= cycles it, and =TAB= folds or opens one row.
+=org-dayflow-visible-depth= (default 1, every top-level heading folded) is
+how many levels a new view shows; =S-TAB= cycles it, and =TAB= folds or
+opens one row.
 
 ** Customization
 
@@ -122,8 +126,8 @@ where it is due.
 (setq org-dayflow-window-setup 'reorganize-frame
       org-dayflow-restore-windows-after-quit t)
 
-;; Show only top-level headings at first (nil shows everything)
-(setq org-dayflow-visible-depth 1)
+;; Show two levels at first (nil shows everything)
+(setq org-dayflow-visible-depth 2)
 
 ;; Compact rendering
 (setq org-dayflow-high-density t)
@@ -131,9 +135,10 @@ where it is due.
 ;; Shade Sat/Sun columns where a column is a day (single face; nil to disable)
 (setq org-dayflow-column-bands t)
 
-;; Default query is open+dated; include done via `/ s' -> "all dated (include done)"
+;; Start from open and dated tasks rather than everything
 ;; (setq org-dayflow-initial-query
-;;       '((or (scheduled) (deadline) (regexp org-ts-regexp))))
+;;       '((and (or (scheduled) (deadline) (regexp org-ts-regexp))
+;;              (not (done)))))
 
 ;; What each period is made of, and how much of it is already behind you.
 ;; The offsets are a share of the period rather than a count of columns,

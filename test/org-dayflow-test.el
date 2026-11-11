@@ -264,9 +264,16 @@ so a demo left on the screen is a week nobody could tell from their own."
   "Return \"YYYY-MM-DD Day\" OFFSET days from today."
   (format-time-string "%Y-%m-%d %a" (time-add nil (days-to-time offset))))
 
-(defmacro org-dayflow-test--with-outline (text &rest body)
+(defconst org-dayflow-test--open-and-dated
+  '((and (or (scheduled) (deadline) (regexp org-ts-regexp))
+         (not (done))))
+  "A query that leaves rows out, so a match can be seen to bring its
+headings and a heading without one to stay out.")
+
+(defmacro org-dayflow-test--with-outline-as-set (text &rest body)
   "Run BODY in a month view over an agenda file holding TEXT.
-`%N' in TEXT is replaced by the date N days from today."
+`%N' in TEXT is replaced by the date N days from today.  The view
+opens with the query and depth the options hold when it is called."
   (declare (indent 1))
   `(let* ((file (make-temp-file "dfoutline" nil ".org"))
           (org-agenda-files (list file))
@@ -292,6 +299,15 @@ so a demo left on the screen is a week nobody could tell from their own."
          (kill-buffer buf))
        (delete-file file))))
 
+(defmacro org-dayflow-test--with-outline (text &rest body)
+  "Run BODY as `org-dayflow-test--with-outline-as-set' does, narrowed by
+`org-dayflow-test--open-and-dated' and open two levels, so there is
+something under a row to fold and something to leave out."
+  (declare (indent 1))
+  `(let ((org-dayflow-initial-query org-dayflow-test--open-and-dated)
+         (org-dayflow-visible-depth 2))
+     (org-dayflow-test--with-outline-as-set ,text ,@body)))
+
 (defconst org-dayflow-test--meeting
   "* 執行会議付議
 ** DONE 論点を洗い出す
@@ -307,6 +323,20 @@ SCHEDULED: <%5> DEADLINE: <%8>
 heading, and a deadline on the last step only.  Then a heading with
 nothing dated under it.")
 
+(ert-deftest org-dayflow-test-a-new-view-is-every-heading-folded ()
+  "Nothing is filtered at first, so what is left out is never a question,
+and each top-level heading is folded into its line.  A heading with no
+date in its subtree has nowhere on the timeline to be drawn."
+  (let ((org-dayflow-initial-query
+         (eval (car (get 'org-dayflow-initial-query 'standard-value))))
+        (org-dayflow-visible-depth
+         (eval (car (get 'org-dayflow-visible-depth 'standard-value)))))
+    (org-dayflow-test--with-outline-as-set org-dayflow-test--meeting
+      (should-not org-dayflow-initial-query)
+      (should (equal '("▸執行会議付議")
+                     (mapcar (lambda (r) (car (split-string r " ")))
+                             (org-dayflow-test--row-titles)))))))
+
 (ert-deftest org-dayflow-test-a-heading-comes-with-its-match ()
   "The heading carries no date and so matches nothing, but a step does,
 and a step drawn without the work it belongs to is a row nobody can place.
@@ -318,7 +348,7 @@ A heading with nothing matching under it stays out."
       (should-not (cl-some (lambda (r) (string-match-p "生活\\|散歩" r)) rows)))))
 
 (ert-deftest org-dayflow-test-a-parent-spans-what-is-done-too ()
-  "The default query leaves done steps out, but the heading's line starts
+  "The open and dated query leaves done steps out, but the heading's line starts
 where the work did: otherwise it would shrink each time a step was done,
 and a month would show work starting today that started last week."
   (org-dayflow-test--with-outline org-dayflow-test--meeting
@@ -350,7 +380,7 @@ step shows its own date and the heading's line does not repeat it."
     (should (member "*資料の骨子" (org-dayflow-test--row-titles)))))
 
 (ert-deftest org-dayflow-test-depth-one-is-the-headings ()
-  "S-TAB from the default two levels shows the whole outline here -- it is
+  "S-TAB from two levels shows the whole outline here -- it is
 only two deep -- and then starts again at the top level alone."
   (org-dayflow-test--with-outline org-dayflow-test--meeting
     (org-dayflow-cycle-depth)
